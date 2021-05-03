@@ -7,6 +7,7 @@ In this project, I'm going to improve the runtime (latency) of batch inference a
 - Outputs:
   - For inference it is the output of the network: a tensor of size (N, 512, 2, 2).
   - For training the output are the gradient (or a gradient update?) of all parameters of this network evaluated at the minibatch. I don't think the intermediate values in the layers of the network is cached at inference time, since the GPU resources needs to be used for rendering. Therefore the forward values needs to be computed here, too.
+- Constraint: It is possible that Pytorch/cuDNN already selects good kernels so there is very limited room for improvement.
 - Task List:
   1. Profile the kernels used in Pytorch to identify the "hotspots" (pretty sure they are the convolutions based on the output of [this script](https://github.com/RuilinLi/CS348K-Project/blob/main/basic_profile.py), ran on my RTX 3070). The Pytorch implementation will be the baseline.
   2. Get familiar with CUTLASS. Implement an unoptimized ResNet block using CUTLASS.
