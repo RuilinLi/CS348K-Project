@@ -1,4 +1,4 @@
-# Accelrating ResNet with Tensor Cores
+# Accelerating ResNet with Tensor Cores
 ### Summary 
 In this project, I'm going to improve the runtime (latency) of batch inference and training of [this particular ResNet](https://github.com/RuilinLi/CS348K-Project/blob/2c17b63ea251ab943d4566e1b069c83e6c5330ae/resnet.py#L651) (code cpied from [here](https://github.com/shacklettbp/bps-nav/blob/master/bps_nav/rl/ddppo/policy/resnet.py)) on Volta and Ampere architectures. I expect most of the speedup will come from effecitve usage of Tensor cores as well as opertator fusion. My plan is to implement each resnet block (including FixUp and Squeeze-and-Excitation, for both forward and backward) using [CUTLASS](https://github.com/NVIDIA/cutlass). I believe its support for Tensor Core, GEMM epilogue, and fused convolution+convolution features will be helpful. The motivation comes from [this paper](https://arxiv.org/pdf/2103.07013.pdf).
 - Inputs: 
