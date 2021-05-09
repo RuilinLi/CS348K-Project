@@ -1,5 +1,4 @@
 from resnet import se_resnet9_fixup
-from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.autograd.profiler as profiler
 
