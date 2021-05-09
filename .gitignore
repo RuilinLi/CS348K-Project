@@ -1,3 +1,6 @@
 __pycache__
 .vscode
 tensorboard_logdir
+conv_cuda.egg-info
+build
+dist

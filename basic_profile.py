@@ -4,7 +4,8 @@ import torch
 import torch.autograd.profiler as profiler
 
 device = torch.device("cuda")
-net = se_resnet9_fixup(3, 64, 16).to(device)
+# Third parameter ngroups here not really used
+net = se_resnet9_fixup(3, 64, -99).to(device)
 
 
 inp = torch.rand((2048, 3, 64, 64), dtype=torch.float16, device=device)
