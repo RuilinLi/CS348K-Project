@@ -8,6 +8,7 @@
 #include "cutlass/conv/kernel/default_conv2d_fprop.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
+#include "linear_combination_relu_fixup.h"
 
 #define CHECK_CUDA(x) \
     TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
@@ -19,9 +20,9 @@
 
 class Conv128x16x16x64NHWC3x3x64NHWC {
     private:
-    using ElementAccumulator = float;  // Data type of accumulator
+    using ElementAccumulator = cutlass::half_t;  // Data type of accumulator
     using ElementComputeEpilogue =
-        float;  // Data type of epilogue computation (alpha, beta)
+        ElementAccumulator;  // Data type of epilogue computation (alpha, beta)
     using ElementInputA =
         cutlass::half_t;  // Data type of elements in input tensor
     using ElementInputB =
@@ -64,7 +65,14 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
 
     // This code section describes the epilogue part of the kernel, we use
     // default value
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+
+    using EpilogueOp1 = cutlass::epilogue::thread::LinearCombinationReluFixUp<
+        ElementOutput,
+        128 / cutlass::sizeof_bits<ElementOutput>::value,
+        ElementAccumulator,
+        ElementComputeEpilogue>;
+
+    using EpilogueOp2 = cutlass::epilogue::thread::LinearCombination<
         ElementOutput,  // Data type of output matrix.
         128 / cutlass::sizeof_bits<ElementOutput>::
                   value,     // The number of elements per vectorized.
@@ -74,7 +82,7 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
         ElementComputeEpilogue>;  // Data type for alpha/beta in linear
                                   // combination
 
-    using Conv2dFpropKernel =
+    using Conv2dFpropKernel1 =
         typename cutlass::conv::kernel::DefaultConv2dFprop<
             ElementInputA,
             LayoutInputA,
@@ -88,49 +96,120 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
             ThreadblockShape,
             WarpShape,
             InstructionShape,
-            EpilogueOp,
+            EpilogueOp1,
             SwizzleThreadBlock,
             NumStages,
             cutlass::arch::OpMultiplyAdd,
             IteratorAlgorithm>::Kernel;
 
-    using ImplicitGemm =
-        cutlass::conv::device::ImplicitGemmConvolution<Conv2dFpropKernel>;
+    using Conv2dFpropKernel2 =
+        typename cutlass::conv::kernel::DefaultConv2dFprop<
+            ElementInputA,
+            LayoutInputA,
+            ElementInputB,
+            LayoutInputB,
+            ElementOutput,
+            LayoutOutput,
+            ElementAccumulator,
+            MMAOp,
+            SmArch,
+            ThreadblockShape,
+            WarpShape,
+            InstructionShape,
+            EpilogueOp2,
+            SwizzleThreadBlock,
+            NumStages,
+            cutlass::arch::OpMultiplyAdd,
+            IteratorAlgorithm>::Kernel;
 
-    static const cutlass::conv::Conv2dProblemSize problem_size;
+    using ImplicitGemm1 =
+        cutlass::conv::device::ImplicitGemmConvolution<Conv2dFpropKernel1>;
+
+    using ImplicitGemm2 =
+        cutlass::conv::device::ImplicitGemmConvolution<Conv2dFpropKernel2>;
+
+    static const cutlass::conv::Conv2dProblemSize problem_size1;
+    static const cutlass::conv::Conv2dProblemSize problem_size2;
     static const cutlass::layout::TensorNHWC layout_activation;
-    static const cutlass::layout::TensorNHWC layout_filter;
-    static const cutlass::layout::TensorNHWC layout_output;
+    static const cutlass::layout::TensorNHWC layout_filter1;
+    static const cutlass::layout::TensorNHWC layout_output1;
+    static const cutlass::layout::TensorNHWC layout_filter2;
+    static const cutlass::layout::TensorNHWC layout_output2;
 
    private:
-    cutlass::TensorRef<cutlass::half_t, cutlass::layout::TensorNHWC> Activation;
-    cutlass::TensorRef<cutlass::half_t, cutlass::layout::TensorNHWC> Filter;
-    cutlass::TensorRef<ElementOutput, cutlass::layout::TensorNHWC> Out;
-    typename ImplicitGemm::Arguments arguments;
+    // cutlass::TensorRef<ElementInputA, cutlass::layout::TensorNHWC> Activation;
+    cutlass::TensorRef<ElementInputB, cutlass::layout::TensorNHWC> Filter1;
+    cutlass::TensorRef<ElementOutput, cutlass::layout::TensorNHWC> Out1;
+    cutlass::TensorRef<ElementInputB, cutlass::layout::TensorNHWC> Filter2;
+    cutlass::TensorRef<ElementOutput, cutlass::layout::TensorNHWC> Out2;
+    const typename ImplicitGemm2::Arguments arguments2;
 
-    ImplicitGemm implicit_gemm_op;
+    // device pointers
+    ElementAccumulator* fixup_bias1a_ptr;
+    ElementAccumulator* fixup_bias1b_ptr;
+    ElementAccumulator* fixup_bias2a_ptr;
+    ElementAccumulator* fixup_bias2b_ptr;
+    ElementAccumulator* fixup_scale_ptr;
+
+
+    // typename ImplicitGemm::Arguments arguments;
+
+    ImplicitGemm1 implicit_gemm_op1;
+    ImplicitGemm2 implicit_gemm_op2;
 
    public:
-    Conv128x16x16x64NHWC3x3x64NHWC(torch::Tensor Activation,
-                                   torch::Tensor Filter,
-                                   torch::Tensor output)
-        : Activation(static_cast<cutlass::half_t*>(Activation.data_ptr()),
-                     layout_activation),
-          Filter(static_cast<cutlass::half_t*>(Filter.data_ptr()),
-                 layout_filter),
-          Out(static_cast<ElementOutput*>(output.data_ptr()), layout_output),
-          arguments{
-              problem_size, this->Activation, this->Filter, Out, Out, {}} {
-        CHECK_INPUT(Activation);
-        CHECK_INPUT(Filter);
-        CHECK_INPUT(output);
+    // Memory management done in pytorch
+    Conv128x16x16x64NHWC3x3x64NHWC(torch::Tensor Filter1,
+                                   torch::Tensor Output1,
+                                   torch::Tensor Filter2,
+                                   torch::Tensor Output2,
+                                   torch::Tensor fixup_bias1a,
+                                   torch::Tensor fixup_bias1b,
+                                   torch::Tensor fixup_bias2a,
+                                   torch::Tensor fixup_bias2b,
+                                   torch::Tensor fixup_scale)
+        : Filter1(static_cast<ElementInputB*>(Filter1.data_ptr()),
+                  layout_filter1),
+          Out1(static_cast<ElementOutput*>(Output1.data_ptr()), layout_output1),
+          Filter2(static_cast<ElementInputB*>(Filter2.data_ptr()),
+                  layout_filter2),
+          Out2(static_cast<ElementOutput*>(Output2.data_ptr()), layout_output2),
+          fixup_bias1a_ptr(
+              static_cast<ElementAccumulator*>(fixup_bias1a.data_ptr())),
+          fixup_bias1b_ptr(
+              static_cast<ElementAccumulator*>(fixup_bias1b.data_ptr())),
+          fixup_bias2a_ptr(
+              static_cast<ElementAccumulator*>(fixup_bias2a.data_ptr())),
+          fixup_bias2b_ptr(
+              static_cast<ElementAccumulator*>(fixup_bias2b.data_ptr())),
+          fixup_scale_ptr(
+              static_cast<ElementAccumulator*>(fixup_scale.data_ptr())),
+          arguments2{problem_size2, this->Out1, this->Filter2, Out2, Out2, {}} {
+        CHECK_INPUT(Filter1);
+        CHECK_INPUT(Output1);
+        CHECK_INPUT(Filter2);
+        CHECK_INPUT(Output2);
+        CHECK_INPUT(fixup_bias1a);
+        CHECK_INPUT(fixup_bias1b);
+        CHECK_INPUT(fixup_bias2a);
+        CHECK_INPUT(fixup_bias2b);
+        CHECK_INPUT(fixup_scale);
     }
 
-    void run() {
-        cutlass::Status status = implicit_gemm_op.initialize(arguments);
-        status = implicit_gemm_op();
-        if (status != cutlass::Status::kSuccess) {
-            std::cout << "something is not working\n";
+    void run(torch::Tensor Activation) {
+        cutlass::TensorRef<ElementInputA, cutlass::layout::TensorNHWC> Act_ref(
+            static_cast<ElementInputA*>(Activation.data_ptr()),
+            layout_activation);
+        const typename ImplicitGemm1::Arguments arguments1{problem_size1, Act_ref, Filter1, Out1, Out1, {fixup_bias1b_ptr, fixup_bias2a_ptr}};
+        cutlass::Status status1 = implicit_gemm_op1.initialize(arguments1);
+        status1 = implicit_gemm_op1();
+
+        cutlass::Status status2 = implicit_gemm_op2.initialize(arguments2);
+        status2 = implicit_gemm_op2();
+
+        if (status1 != cutlass::Status::kSuccess || status2 != cutlass::Status::kSuccess) {
+            std::cout << cutlass::cutlassGetStatusString(status1) << std::endl;
+            std::cout << cutlass::cutlassGetStatusString(status2) << std::endl;
         } else {
             std::cout << "Done!\n";
         }
@@ -138,7 +217,18 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
 };
 
 const cutlass::conv::Conv2dProblemSize
-    Conv128x16x16x64NHWC3x3x64NHWC::problem_size(
+    Conv128x16x16x64NHWC3x3x64NHWC::problem_size1(
+        {128, 16, 16, 64},
+        {64, 3, 3, 64},
+        {1, 0, 1, 0},
+        {1, 1},
+        {1, 1},
+        {128, 16, 16, 64},
+        cutlass::conv::Mode::kCrossCorrelation,
+        1);
+
+const cutlass::conv::Conv2dProblemSize
+    Conv128x16x16x64NHWC3x3x64NHWC::problem_size2(
         {128, 16, 16, 64},
         {64, 3, 3, 64},
         {1, 0, 1, 0},
@@ -153,9 +243,17 @@ const cutlass::layout::TensorNHWC
         cutlass::layout::TensorNHWC::packed({128, 16, 16, 64});
 
 const cutlass::layout::TensorNHWC
-    Conv128x16x16x64NHWC3x3x64NHWC::layout_filter =
+    Conv128x16x16x64NHWC3x3x64NHWC::layout_filter1 =
         cutlass::layout::TensorNHWC::packed({64, 3, 3, 64});
 
 const cutlass::layout::TensorNHWC
-    Conv128x16x16x64NHWC3x3x64NHWC::layout_output =
+    Conv128x16x16x64NHWC3x3x64NHWC::layout_output1 =
+        cutlass::layout::TensorNHWC::packed({128, 16, 16, 64});
+
+const cutlass::layout::TensorNHWC
+    Conv128x16x16x64NHWC3x3x64NHWC::layout_filter2 =
+        cutlass::layout::TensorNHWC::packed({64, 3, 3, 64});
+
+const cutlass::layout::TensorNHWC
+    Conv128x16x16x64NHWC3x3x64NHWC::layout_output2 =
         cutlass::layout::TensorNHWC::packed({128, 16, 16, 64});

@@ -8,13 +8,23 @@ import torch.nn.functional as F
 
 device=torch.device("cuda")
 
-a = torch.randn((128, 16, 16, 64), dtype=torch.float16, device=device)
-fil = torch.randn((64, 3,3, 64), dtype=torch.float16, device=device)
-c = torch.zeros((128, 16, 16, 64), dtype=torch.float16, device=device)
-my_obj = conv_cuda.Conv128x16x16x64NHWC3x3x64NHWC(a, fil, c)
-my_obj.run()
+a = torch.ones((128, 16, 16, 64), dtype=torch.float16, device=device)/100
+fil = torch.ones((64, 3,3, 64), dtype=torch.float16, device=device)/100
+fil2 = torch.ones((64, 3,3, 64), dtype=torch.float16, device=device)/100
 
-ref = F.conv2d(a.permute((0,3,1,2)), fil.permute((0, 3, 1, 2)), padding=1).permute(0, 2, 3, 1)
+d1 = torch.ones((1), dtype=torch.float16, device=device)
+d2 = torch.ones((1), dtype=torch.float16, device=device) * 0.123
+d3 = torch.ones((1), dtype=torch.float16, device=device) * 0.234
+d4 = torch.ones((1), dtype=torch.float16, device=device)
+d5 = torch.ones((1), dtype=torch.float16, device=device)
 
-print((ref - c).max())
-print((ref - c).min())
+
+out1 = torch.zeros((128, 16, 16, 64), dtype=torch.float16, device=device)
+out2 = torch.zeros((128, 16, 16, 64), dtype=torch.float16, device=device)
+my_obj = conv_cuda.Conv128x16x16x64NHWC3x3x64NHWC(fil, out1, fil2, out2, d1, d2, d3, d4, d5)
+my_obj.run(a)
+
+# ref = F.conv2d(a.permute((0,3,1,2)), fil.permute((0, 3, 1, 2)), padding=1).permute(0, 2, 3, 1)
+
+# print((ref - c).max())
+# print((ref - c).min())
