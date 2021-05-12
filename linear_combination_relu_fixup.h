@@ -131,10 +131,21 @@ public:
   /// Functionally required for serial reduction in the epilogue
   CUTLASS_HOST_DEVICE
   void set_k_partition(int k_partition, int k_partition_count) {
-    // Won't work if split k
-  }
-  
+      if (k_partition) {
+          // not really needed becuase
+          // in the first K-partition there should be no source
+          // in the rest of the partitions bias1_ is not used
+          bias1_ = ElementCompute(0);
+      }
 
+      if (k_partition != k_partition_count - 1) {
+          // set to NaN to make ReLU no-op for all except last k partitions
+          int64_t allones = -1;
+          threshold_ = reinterpret_cast<ElementCompute const &>(allones);
+          // Only add the second bias at the last K-partition
+          bias2_ = ElementCompute(0);
+      }
+  }
 
   /// Computes: D =  relu(accumulator + bias1) + bias2
   CUTLASS_HOST_DEVICE
@@ -168,16 +179,38 @@ public:
     return destination_converter(intermediate);
   }
 
-  // This method should not be called, but it has be here 
+  // This method is only needed for split-k 
   CUTLASS_HOST_DEVICE
   FragmentOutput operator()(FragmentAccumulator const &accumulator,
                             FragmentOutput const &source) const {
-      if(blockIdx.x + threadIdx.x ==0){
-         printf("Wrong kernel is called \n");
-      }
-      NumericArrayConverter<ElementOutput, ElementAccumulator, kCount, Round>
+      // Convert source to interal compute numeric type
+      NumericArrayConverter<ElementCompute, ElementOutput, kCount, Round>
+          source_converter;
+      NumericArrayConverter<ElementCompute, ElementAccumulator, kCount, Round>
           accumulator_converter;
-      return accumulator_converter(accumulator);
+
+      ComputeFragment converted_source = source_converter(source);
+      ComputeFragment converted_accumulator =
+          accumulator_converter(accumulator);
+
+      // Perform binary operations
+      ComputeFragment intermediate;
+
+      plus<ComputeFragment> plus_obj;
+      ReLu<ComputeFragment> relu;
+
+      intermediate = plus_obj(converted_source, converted_accumulator);
+
+      // Compute threshold optionally
+      intermediate = relu(threshold_, intermediate);
+
+      intermediate = plus_obj(bias2_, intermediate);
+
+      // Convert to destination numeric type
+      NumericArrayConverter<ElementOutput, ElementCompute, kCount, Round>
+          destination_converter;
+
+      return destination_converter(intermediate);
   }
 };
 /////////////////////////////////////////////////////////////////////////////////////////////////

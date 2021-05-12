@@ -7,4 +7,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                       torch::Tensor, torch::Tensor, torch::Tensor,
                       torch::Tensor, torch::Tensor, torch::Tensor>())
         .def("run", &Conv128x16x16x64NHWC3x3x64NHWC::run);
+
+    py::class_<ResnetSE>(m, "MyResnetSE")
+        .def(py::init<torch::Tensor, torch::Tensor>())
+        .def("reduce", &ResnetSE::reduce);
 }

@@ -9,6 +9,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
 #include "linear_combination_relu_fixup.h"
+#include "cutlass/reduction/device/tensor_reduce.h"
 
 #define CHECK_CUDA(x) \
     TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
@@ -257,3 +258,70 @@ const cutlass::layout::TensorNHWC
 const cutlass::layout::TensorNHWC
     Conv128x16x16x64NHWC3x3x64NHWC::layout_output2 =
         cutlass::layout::TensorNHWC::packed({128, 16, 16, 64});
+
+
+
+// To start off assume input has dimension (128, 16, 16, 64)
+// To use cutlass reduction, interpret as a (1, 128,  256, 64) tensor
+// reduction -> (1, 128, 1, 64) -> row major matrix (128, 64)
+// bottle neck (128, 64) -> (128, 4) -> (128, 64):
+// let x be the resnet input (possibly downsampled), y be the output
+// what needs to be done here are
+// relu(y * se(y) + x)
+
+class ResnetSE {
+   private:
+    using Layout = cutlass::layout::TensorNHWC;
+    using ElementOutput = cutlass::half_t;
+    using ElementSource = cutlass::half_t;
+    using ElementCompute = float;
+
+
+    // Define the functor
+    using Functor = cutlass::plus<ElementCompute>;
+
+    static int const kV = 1;
+
+    using TensorReduction =
+        cutlass::reduction::device::TensorReduction<ElementOutput,
+                                                    ElementSource,
+                                                    Layout,
+                                                    Functor,
+                                                    kV,
+                                                    ElementCompute>;
+
+    static const cutlass::layout::TensorNHWC input_tensor_layout;
+    static const cutlass::layout::TensorNHWC squeezed_tensor_layout;
+    static const cutlass::layout::RowMajor squeezed_matrix_layout;
+    static const cutlass::layout::RowMajor W1_layout;
+    static const cutlass::layout::RowMajor W2_layout;
+
+    cutlass::TensorRef<ElementSource, cutlass::layout::TensorNHWC> Activation;
+    cutlass::TensorRef<ElementOutput, cutlass::layout::TensorNHWC> SE_output;
+
+    TensorReduction reduction;
+
+   public:
+    ResnetSE(torch::Tensor Activation, torch::Tensor SE_output)
+        : Activation(static_cast<ElementSource*>(Activation.data_ptr()),
+                     input_tensor_layout),
+          SE_output(static_cast<ElementOutput*>(SE_output.data_ptr()),
+                    squeezed_tensor_layout),
+          reduction({1, 128, 256, 64}, 2) {
+        CHECK_INPUT(Activation);
+        CHECK_INPUT(SE_output);
+    }
+
+    void reduce() {
+        cutlass::Status status = reduction.reduce(SE_output, Activation);
+        if (status != cutlass::Status::kSuccess) {
+            std::cout << cutlass::cutlassGetStatusString(status) << std::endl;
+        }
+    }
+};
+
+const cutlass::layout::TensorNHWC ResnetSE::input_tensor_layout = cutlass::layout::TensorNHWC::packed({1, 128, 256, 64});
+const cutlass::layout::TensorNHWC ResnetSE::squeezed_tensor_layout = cutlass::layout::TensorNHWC::packed({1, 128, 1, 64});
+const cutlass::layout::RowMajor squeezed_matrix_layout = cutlass::layout::RowMajor::packed({128, 64});
+const cutlass::layout::RowMajor W1_layout = cutlass::layout::RowMajor::packed({64, 4});
+const cutlass::layout::RowMajor W2_layout = cutlass::layout::RowMajor::packed({4, 64});
