@@ -35,15 +35,17 @@ __global__ void SEb2bGEMMFused_Kernel(
 
     cutlass::epilogue::thread::Sigmoid<float> sigmoid_op;
 
+    constexpr int HALF_T_BANK_PADDING = 2;
+
 
     cutlass::half_t out0_tile[N0];
     cutlass::half_t W0_register[N0 * K0];  // load entire W0 to register
     __shared__ cutlass::half_t
-        A0_tile[Mtile_size * (K0 + 1)];  // add an offset to avoid bank conflict
+        A0_tile[Mtile_size * (K0 + HALF_T_BANK_PADDING)];  // add an offset to avoid bank conflict
 
 #pragma unroll 32
     for (int i = 0; i < K0; i++) {
-        A0_tile[threadIdx.x * (K0 + 1) + i] =
+        A0_tile[threadIdx.x * (K0 + HALF_T_BANK_PADDING) + i] =
             Squeezed[(blockIdx.x * Mtile_size + threadIdx.x) * K0 + i] * static_cast<cutlass::half_t>(0.00390625f); // averaging from the last part
     }
 
@@ -89,7 +91,7 @@ __global__ void SEb2bGEMMFused_Kernel(
 #pragma unroll N0
         for (int i = 0; i < N0; ++i) {
             out0_tile[i] +=
-                A0_tile[threadIdx.x * (K0 + 1) + k] * W0_register[k * N0 + i];
+                A0_tile[threadIdx.x * (K0 + HALF_T_BANK_PADDING) + k] * W0_register[k * N0 + i];
         }
     }
 
