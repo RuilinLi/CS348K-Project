@@ -46,15 +46,16 @@ namespace thread {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Applies a linear combination operator to an array of elements.
+/// Computes: D =  op(accumulator * scale + bias1) + bias2 to an array of elements.
 ///
-/// D = alpha * accumulator + beta * source + uniform
+/// op = relu if ApplyRelu = true, otherwise op = identity map
 ///
 template <
   typename ElementOutput_,                             ///< Data type used to load and store tensors
   int Count,                                           ///< Number of elements computed per operation
   typename ElementAccumulator_ = ElementOutput_,       ///< Accumulator data type
   typename ElementCompute_ = ElementOutput_,           ///< Data type used to compute linear combination
+  bool ApplyRelu = true,
   ScaleType::Kind Scale = ScaleType::Default,          ///< Control Alpha and Beta scaling
   FloatRoundStyle Round = FloatRoundStyle::round_to_nearest
 >
@@ -76,14 +77,10 @@ public:
   /// Host-constructable parameters structure
   struct Params {
 
-    // ElementCompute alpha;                  ///< scales accumulators
-    // ElementCompute beta;                   ///< scales source tensor
-    // ElementCompute threshold;              ///< minimum value that is output 
-    // ElementCompute const *alpha_ptr;       ///< pointer to accumulator scalar - if not null, loads it from memory
-    // ElementCompute const *beta_ptr;        ///< pointer to source scalar - if not null, loads it from memory
 
     ElementCompute const *bias1_ptr;
     ElementCompute const *bias2_ptr;
+    ElementCompute const *scale_ptr;
     ElementCompute threshold;
     //
     // Methods
@@ -93,12 +90,23 @@ public:
     Params()
         : bias1_ptr(nullptr),
           bias2_ptr(nullptr),
+          scale_ptr(nullptr),
           threshold(ElementCompute(0)) {}
 
     CUTLASS_HOST_DEVICE
     Params(ElementCompute const *bias1_ptr, ElementCompute const *bias2_ptr)
         : bias1_ptr(bias1_ptr),
           bias2_ptr(bias2_ptr),
+          scale_ptr(nullptr),
+          threshold(ElementCompute(0)) {}
+
+    CUTLASS_HOST_DEVICE
+    Params(ElementCompute const *bias1_ptr,
+           ElementCompute const *bias2_ptr,
+           ElementCompute const *scale_ptr)
+        : bias1_ptr(bias1_ptr),
+          bias2_ptr(bias2_ptr),
+          scale_ptr(scale_ptr),
           threshold(ElementCompute(0)) {}
   };
 
@@ -110,6 +118,7 @@ private:
 
   ElementCompute bias1_;
   ElementCompute bias2_;
+  ElementCompute scale_;
   ElementCompute threshold_;
 
 public:
@@ -119,7 +128,12 @@ public:
   LinearCombinationReluFixUp(Params const &params) {
     bias1_ = (params.bias1_ptr)?(*params.bias1_ptr):ElementCompute(0);
     bias2_ = (params.bias2_ptr)?(*params.bias2_ptr):ElementCompute(0);
+    scale_ = (params.scale_ptr)?(*params.scale_ptr):ElementCompute(1);
     threshold_ = params.threshold;
+
+    // printf("Bias1 is %f and bias2 is %f, thresh is %f, scale is %f \n",
+    //        static_cast<float>(bias1_), static_cast<float>(bias2_),
+    //        static_cast<float>(threshold_), static_cast<float>(scale_));
   }
 
   /// Returns true if source is needed
@@ -151,7 +165,7 @@ public:
   CUTLASS_HOST_DEVICE
   FragmentOutput operator()(
     FragmentAccumulator const &accumulator) const {
-    //       if(blockIdx.x + threadIdx.x ==0){
+    // if(blockIdx.x + threadIdx.x ==0){
     //      printf("Bias1 is %f and bias2 is %f, thresh is  %f \n", static_cast<float>(bias1_), static_cast<float>(bias2_), static_cast<float>(threshold_));
     // }
 
@@ -163,14 +177,20 @@ public:
     // Perform binary operations
     ComputeFragment intermediate;
 
+    // D = scale * Accum + bias1
+    // Should probably just add this to functional.h
+    multiply_add<ElementCompute> scalar_op;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kCount; ++i) {
+        intermediate[i] = scalar_op(scale_, converted_accumulator[i], bias1_);
+    }
+
+    // Compute Relu optionally
+    if (ApplyRelu) {
+        ReLu<ComputeFragment> relu;
+        intermediate = relu(threshold_, intermediate);
+    }
     plus<ComputeFragment> plus_obj;
-    ReLu<ComputeFragment> relu;
-
-    intermediate = plus_obj(bias1_, converted_accumulator);    // D = alpha * Accum
-
-    // Compute threshold optionally
-    intermediate = relu(threshold_, intermediate);
-
     intermediate = plus_obj(bias2_, intermediate);
 
     // Convert to destination numeric type
@@ -196,14 +216,20 @@ public:
       // Perform binary operations
       ComputeFragment intermediate;
 
+      // D = scale * Accum + bias1
+      multiply_add<ElementCompute> scalar_op;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < kCount; ++i) {
+          intermediate[i] = scalar_op(scale_, converted_accumulator[i], bias1_);
+      }
+      // Compute Relu optionally
+      if (ApplyRelu) {
+          ReLu<ComputeFragment> relu;
+          intermediate = relu(threshold_, intermediate);
+      }
+      
       plus<ComputeFragment> plus_obj;
-      ReLu<ComputeFragment> relu;
-
-      intermediate = plus_obj(converted_source, converted_accumulator);
-
-      // Compute threshold optionally
-      intermediate = relu(threshold_, intermediate);
-
       intermediate = plus_obj(bias2_, intermediate);
 
       // Convert to destination numeric type

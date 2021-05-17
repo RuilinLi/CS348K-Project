@@ -11,6 +11,7 @@
 #include "linear_combination_relu_fixup.h"
 #include "cutlass/reduction/device/tensor_reduce.h"
 
+
 #define CHECK_CUDA(x) \
     TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) \
@@ -69,19 +70,17 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
 
     using EpilogueOp1 = cutlass::epilogue::thread::LinearCombinationReluFixUp<
         ElementOutput,
-        128 / cutlass::sizeof_bits<ElementOutput>::value,
+        128 / cutlass::sizeof_bits<ElementOutput>::value, // should this really be instruction shape M x N / 32?
         ElementAccumulator,
         ElementComputeEpilogue>;
 
-    using EpilogueOp2 = cutlass::epilogue::thread::LinearCombination<
-        ElementOutput,  // Data type of output matrix.
-        128 / cutlass::sizeof_bits<ElementOutput>::
-                  value,     // The number of elements per vectorized.
-                             // memory access. This becomes the vector width of
-                             // math instructions in the epilogue too.
-        ElementAccumulator,  // Data type of accumulator
-        ElementComputeEpilogue>;  // Data type for alpha/beta in linear
-                                  // combination
+    using EpilogueOp2 = cutlass::epilogue::thread::LinearCombinationReluFixUp<
+        ElementOutput,
+        128 / cutlass::sizeof_bits<ElementOutput>::value,
+        ElementAccumulator,
+        ElementComputeEpilogue,
+        false // Don't apply relu
+        >;
 
     using Conv2dFpropKernel1 =
         typename cutlass::conv::kernel::DefaultConv2dFprop<
@@ -143,10 +142,10 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
     cutlass::TensorRef<ElementOutput, cutlass::layout::TensorNHWC> Out1;
     cutlass::TensorRef<ElementInputB, cutlass::layout::TensorNHWC> Filter2;
     cutlass::TensorRef<ElementOutput, cutlass::layout::TensorNHWC> Out2;
-    const typename ImplicitGemm2::Arguments arguments2;
+    // const typename ImplicitGemm2::Arguments arguments2;
 
     // device pointers
-    ElementAccumulator* fixup_bias1a_ptr;
+    // bias1a should be added during the computation of the previous block
     ElementAccumulator* fixup_bias1b_ptr;
     ElementAccumulator* fixup_bias2a_ptr;
     ElementAccumulator* fixup_bias2b_ptr;
@@ -164,7 +163,6 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
                                    torch::Tensor Output1,
                                    torch::Tensor Filter2,
                                    torch::Tensor Output2,
-                                   torch::Tensor fixup_bias1a,
                                    torch::Tensor fixup_bias1b,
                                    torch::Tensor fixup_bias2a,
                                    torch::Tensor fixup_bias2b,
@@ -175,8 +173,6 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
           Filter2(static_cast<ElementInputB*>(Filter2.data_ptr()),
                   layout_filter2),
           Out2(static_cast<ElementOutput*>(Output2.data_ptr()), layout_output2),
-          fixup_bias1a_ptr(
-              static_cast<ElementAccumulator*>(fixup_bias1a.data_ptr())),
           fixup_bias1b_ptr(
               static_cast<ElementAccumulator*>(fixup_bias1b.data_ptr())),
           fixup_bias2a_ptr(
@@ -184,13 +180,11 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
           fixup_bias2b_ptr(
               static_cast<ElementAccumulator*>(fixup_bias2b.data_ptr())),
           fixup_scale_ptr(
-              static_cast<ElementAccumulator*>(fixup_scale.data_ptr())),
-          arguments2{problem_size2, this->Out1, this->Filter2, Out2, Out2, {}} {
+              static_cast<ElementAccumulator*>(fixup_scale.data_ptr())){
         CHECK_INPUT(Filter1);
         CHECK_INPUT(Output1);
         CHECK_INPUT(Filter2);
         CHECK_INPUT(Output2);
-        CHECK_INPUT(fixup_bias1a);
         CHECK_INPUT(fixup_bias1b);
         CHECK_INPUT(fixup_bias2a);
         CHECK_INPUT(fixup_bias2b);
@@ -202,6 +196,7 @@ class Conv128x16x16x64NHWC3x3x64NHWC {
             static_cast<ElementInputA*>(Activation.data_ptr()),
             layout_activation);
         const typename ImplicitGemm1::Arguments arguments1{problem_size1, Act_ref, Filter1, Out1, Out1, {fixup_bias1b_ptr, fixup_bias2a_ptr}};
+        const typename ImplicitGemm2::Arguments arguments2{problem_size2, this->Out1, this->Filter2, Out2, Out2, {fixup_bias2b_ptr, nullptr, fixup_scale_ptr}};
         cutlass::Status status1 = implicit_gemm_op1.initialize(arguments1);
         status1 = implicit_gemm_op1();
 
@@ -261,67 +256,3 @@ const cutlass::layout::TensorNHWC
 
 
 
-// To start off assume input has dimension (128, 16, 16, 64)
-// To use cutlass reduction, interpret as a (1, 128,  256, 64) tensor
-// reduction -> (1, 128, 1, 64) -> row major matrix (128, 64)
-// bottle neck (128, 64) -> (128, 4) -> (128, 64):
-// let x be the resnet input (possibly downsampled), y be the output
-// what needs to be done here are
-// relu(y * se(y) + x)
-
-class ResnetSE {
-   private:
-    using Layout = cutlass::layout::TensorNHWC;
-    using ElementOutput = cutlass::half_t;
-    using ElementSource = cutlass::half_t;
-    using ElementCompute = float;
-
-
-    // Define the functor
-    using Functor = cutlass::plus<ElementCompute>;
-
-    static int const kV = 1;
-
-    using TensorReduction =
-        cutlass::reduction::device::TensorReduction<ElementOutput,
-                                                    ElementSource,
-                                                    Layout,
-                                                    Functor,
-                                                    kV,
-                                                    ElementCompute>;
-
-    static const cutlass::layout::TensorNHWC input_tensor_layout;
-    static const cutlass::layout::TensorNHWC squeezed_tensor_layout;
-    static const cutlass::layout::RowMajor squeezed_matrix_layout;
-    static const cutlass::layout::RowMajor W1_layout;
-    static const cutlass::layout::RowMajor W2_layout;
-
-    cutlass::TensorRef<ElementSource, cutlass::layout::TensorNHWC> Activation;
-    cutlass::TensorRef<ElementOutput, cutlass::layout::TensorNHWC> SE_output;
-
-    TensorReduction reduction;
-
-   public:
-    ResnetSE(torch::Tensor Activation, torch::Tensor SE_output)
-        : Activation(static_cast<ElementSource*>(Activation.data_ptr()),
-                     input_tensor_layout),
-          SE_output(static_cast<ElementOutput*>(SE_output.data_ptr()),
-                    squeezed_tensor_layout),
-          reduction({1, 128, 256, 64}, 2) {
-        CHECK_INPUT(Activation);
-        CHECK_INPUT(SE_output);
-    }
-
-    void reduce() {
-        cutlass::Status status = reduction.reduce(SE_output, Activation);
-        if (status != cutlass::Status::kSuccess) {
-            std::cout << cutlass::cutlassGetStatusString(status) << std::endl;
-        }
-    }
-};
-
-const cutlass::layout::TensorNHWC ResnetSE::input_tensor_layout = cutlass::layout::TensorNHWC::packed({1, 128, 256, 64});
-const cutlass::layout::TensorNHWC ResnetSE::squeezed_tensor_layout = cutlass::layout::TensorNHWC::packed({1, 128, 1, 64});
-const cutlass::layout::RowMajor squeezed_matrix_layout = cutlass::layout::RowMajor::packed({128, 64});
-const cutlass::layout::RowMajor W1_layout = cutlass::layout::RowMajor::packed({64, 4});
-const cutlass::layout::RowMajor W2_layout = cutlass::layout::RowMajor::packed({4, 64});
