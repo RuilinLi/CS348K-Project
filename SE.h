@@ -157,9 +157,8 @@ __global__ void SEb2bGEMMFused_Kernel2(
     const int reduction_thread_per_channel = blockDim.x / K0;
     const int thread_reduction_width = (IMG_SIZE * IMG_SIZE)/reduction_thread_per_channel;
     __shared__ cutlass::half_t A0_row[K0];
-    const int channel_id = threadIdx.x % N0;
-    const int start_row_id = (threadIdx.x / N0) * thread_reduction_width;
-    cutlass::half_t tmp(0.f);
+    const int channel_id = threadIdx.x % K0;
+    const int start_row_id = (threadIdx.x / K0) * thread_reduction_width;
 
     cutlass::epilogue::thread::Sigmoid<float> sigmoid_op;
 
@@ -169,6 +168,7 @@ __global__ void SEb2bGEMMFused_Kernel2(
     __shared__ cutlass::half_t bias1_shared[N1];
 
 
+    // Issue memcpy to get the first weight matrix and bias
     if(threadIdx.x < (N0 * K0)/8){
         __pipeline_memcpy_async(&W0_shared[8 * threadIdx.x],
                                 &W0[8 * threadIdx.x],
@@ -183,7 +183,8 @@ __global__ void SEb2bGEMMFused_Kernel2(
 
     __pipeline_commit();
 
-    
+    // Each thread computes part of the channel-wise average
+    cutlass::half_t tmp(0.f);
     #pragma unroll 16
     for(int i = 0; i < thread_reduction_width; ++i){
         // add (blockIdx.x, start_row_id+i, channel_id)
@@ -193,18 +194,20 @@ __global__ void SEb2bGEMMFused_Kernel2(
     if(threadIdx.x < K0){
         A0_row[threadIdx.x] = cutlass::half_t(0.f);
     }
+    __syncthreads();
 
-
+    // Put the partial reduction together
     for(int i = 0; i < reduction_thread_per_channel; ++i){
-        if((threadIdx.x / N0) == i){
+        if((threadIdx.x / K0) == i){
             A0_row[channel_id] += tmp * static_cast<cutlass::half_t>(1.f/(IMG_SIZE * IMG_SIZE));
         }
         __syncthreads();
     }
 
-
+    // Wait until W0, bias0 arrives
     __pipeline_wait_prior(0);
 
+    // Issue async memcpy to get W1 and bias1
     if(threadIdx.x < (N1 * K1)/8){
         __pipeline_memcpy_async(&W1_shared[8 * threadIdx.x],
                                 &W1[8 * threadIdx.x],
@@ -223,23 +226,25 @@ __global__ void SEb2bGEMMFused_Kernel2(
     __pipeline_commit();
 
 
-    // Always use more thread than W0 size
 
-    if(threadIdx.x < K0 * N0){
-        W0_shared[threadIdx.x] *= A0_row[threadIdx.x / N0];
+    // decompose matrix multiplication to element-wise multiplication and reduction
+    for(int i = 0; i < ((K0 * N0) + blockDim.x - 1)/blockDim.x; ++i){
+        const int linear_idx = threadIdx.x + i * blockDim.x;
+        if(linear_idx < K0 * N0){
+            W0_shared[linear_idx] *= A0_row[linear_idx / N0]; //broadcast, no bank conflict
+        }
     }
+    // if(threadIdx.x < K0 * N0){
+    //     W0_shared[threadIdx.x] *= A0_row[threadIdx.x / N0];
+    // }
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
     const int col_idx = warp_id % N0;
     const int row_idx = 32 * (warp_id / N0);
-    const int linear_idx = (row_idx + lane_id) * N0 + col_idx;
 
-    // if(linear_idx < K0 * N0){
-    //     W0_shared[linear_idx] *= A0_row[row_idx + lane_id]; //save a syncthreads
-    // }
     __syncthreads();
-
+    // Reduction
     for(unsigned int s = K0 / 2; s > 32; s>>=1){
         if(row_idx + lane_id < s){
             W0_shared[(row_idx + lane_id) * N0 + col_idx] += W0_shared[(row_idx + lane_id + s) * N0 + col_idx];
@@ -266,38 +271,40 @@ __global__ void SEb2bGEMMFused_Kernel2(
     
     __pipeline_wait_prior(0);
     __syncthreads();
-    if(threadIdx.x < K1 * N1){
-        W1_shared[threadIdx.x] *= W0_shared[threadIdx.x / N1];
+    // if(threadIdx.x < K1 * N1){
+    //     W1_shared[threadIdx.x] *= W0_shared[threadIdx.x / N1];
+    // }
+    for (int i = 0; i < ((K1 * N1) + blockDim.x - 1) / blockDim.x; ++i) {
+        const int linear_idx = threadIdx.x + i * blockDim.x;
+        if (linear_idx < K1 * N1) {
+            W1_shared[linear_idx] *=
+                W0_shared[linear_idx / N1];  // broadcast, no bank conflict
+        }
     }
 
     __syncthreads();
     // another small reduction hard code it
-    // N1 = 64, K1 = 4
-    if(N1 == 64){
-        const int row_idx1 = threadIdx.x / N1;
-        const int col_idx1 = threadIdx.x % N1;
-        if(row_idx1 < 2){
-            W1_shared[col_idx1+row_idx1*N1] +=  W1_shared[col_idx1+(row_idx1+2)*N1];
+    // N1 = 64, K1 = 4, or N1 = 128, K1 = 8
+    const int row_idx1 = threadIdx.x / N1;
+    const int col_idx1 = threadIdx.x % N1;
+
+    if (N1 == 128) {
+        if (row_idx1 < 4) {
+            W1_shared[col_idx1 + row_idx1 * N1] +=
+                W1_shared[col_idx1 + (row_idx1 + 4) * N1];
         }
         __syncthreads();
-        if(row_idx1 == 0){
-            W1_shared[col_idx1] += W1_shared[col_idx1 + N1];
-        }
-
     }
     
-    // N1 = 128, K1 = 8, num_threads = 1024
-    if(N1 == 128){
-        const int row_idx1 = threadIdx.x / N1;
-        const int col_idx1 = threadIdx.x % N1;
-        if(row_idx1 < 4){
-            W1_shared[col_idx1+row_idx1*N1] +=  W1_shared[col_idx1+(row_idx1+4)*N1];
-            __syncthreads();
-            W1_shared[col_idx1+row_idx1*N1] +=  W1_shared[col_idx1+(row_idx1+2)*N1];
-            __syncthreads();
-            W1_shared[col_idx1+row_idx1*N1] +=  W1_shared[col_idx1+(row_idx1+1)*N1];
-        }
+    if (row_idx1 < 2) {
+        W1_shared[col_idx1 + row_idx1 * N1] +=
+            W1_shared[col_idx1 + (row_idx1 + 2) * N1];
     }
+    __syncthreads();
+    if (row_idx1 == 0) {
+        W1_shared[col_idx1] += W1_shared[col_idx1 + N1];
+    }
+
 
     __syncthreads();
     // bias + sigmoid
@@ -307,6 +314,7 @@ __global__ void SEb2bGEMMFused_Kernel2(
     }
     __syncthreads();
     // Finally multiply the activation with size (IMG_SIZE, IMG_SIZE, K0)
+    // (IMG_SIZE * IMG_SIZE * K0) must be an integer multiple of blockDim.x
     #pragma unroll 8
     for(int i = 0; i < (IMG_SIZE * IMG_SIZE * K0) / blockDim.x; ++i){
         const int inner_idx = threadIdx.x + i * blockDim.x;
