@@ -145,6 +145,177 @@ __global__ void SEb2bGEMMFused_Kernel(
     }
 }
 
+template <int N0, int K0=N0*16, int N1=K0, int K1 = N0, int Mtile_size=32, int IMG_SIZE=64/N0>
+__global__ void SEb2bGEMMFused_Kernel2(
+    const cutlass::half_t* __restrict__ activation,
+    const cutlass::half_t* __restrict__ W0,
+    const cutlass::half_t* __restrict__ bias0,
+    const cutlass::half_t* __restrict__ W1,
+    const cutlass::half_t* __restrict__ bias1,
+    cutlass::half_t* __restrict__ downsampled) {
+    
+    const int reduction_thread_per_channel = blockDim.x / K0;
+    const int thread_reduction_width = (IMG_SIZE * IMG_SIZE)/reduction_thread_per_channel;
+    __shared__ cutlass::half_t A0_row[K0];
+    const int channel_id = threadIdx.x % N0;
+    const int start_row_id = (threadIdx.x / N0) * thread_reduction_width;
+    cutlass::half_t tmp(0.f);
+
+    cutlass::epilogue::thread::Sigmoid<float> sigmoid_op;
+
+    __shared__ cutlass::half_t W0_shared[N0 * K0];
+    __shared__ cutlass::half_t W1_shared[N1 * K1];
+    __shared__ cutlass::half_t bias0_shared[N0];
+    __shared__ cutlass::half_t bias1_shared[N1];
+
+
+    if(threadIdx.x < (N0 * K0)/8){
+        __pipeline_memcpy_async(&W0_shared[8 * threadIdx.x],
+                                &W0[8 * threadIdx.x],
+                                8 * sizeof(cutlass::half_t));
+    }
+
+    // N0 = 4 or 8
+    if(threadIdx.x == 0){
+        __pipeline_memcpy_async(&bias0_shared[0], &bias0[0],
+                                N0 * sizeof(cutlass::half_t));
+    }
+
+    __pipeline_commit();
+
+    
+    #pragma unroll 16
+    for(int i = 0; i < thread_reduction_width; ++i){
+        // add (blockIdx.x, start_row_id+i, channel_id)
+        tmp += activation[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + (start_row_id + i) * K0 + channel_id];
+    }
+
+    if(threadIdx.x < K0){
+        A0_row[threadIdx.x] = cutlass::half_t(0.f);
+    }
+
+
+    for(int i = 0; i < reduction_thread_per_channel; ++i){
+        if((threadIdx.x / N0) == i){
+            A0_row[channel_id] += tmp * static_cast<cutlass::half_t>(1.f/(IMG_SIZE * IMG_SIZE));
+        }
+        __syncthreads();
+    }
+
+
+    __pipeline_wait_prior(0);
+
+    if(threadIdx.x < (N1 * K1)/8){
+        __pipeline_memcpy_async(&W1_shared[8 * threadIdx.x],
+                                &W1[8 * threadIdx.x],
+                                8 * sizeof(cutlass::half_t));
+    }
+    
+
+    // Need to confirm this, if send k byte then input must be k-aligned?
+    if(threadIdx.x < (N1 / 4)){
+        __pipeline_memcpy_async(&bias1_shared[4 * threadIdx.x], &bias1[4 * threadIdx.x],
+                                4 * sizeof(cutlass::half_t));
+    }
+
+
+
+    __pipeline_commit();
+
+
+    // Always use more thread than W0 size
+
+    if(threadIdx.x < K0 * N0){
+        W0_shared[threadIdx.x] *= A0_row[threadIdx.x / N0];
+    }
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int col_idx = warp_id % N0;
+    const int row_idx = 32 * (warp_id / N0);
+    const int linear_idx = (row_idx + lane_id) * N0 + col_idx;
+
+    // if(linear_idx < K0 * N0){
+    //     W0_shared[linear_idx] *= A0_row[row_idx + lane_id]; //save a syncthreads
+    // }
+    __syncthreads();
+
+    for(unsigned int s = K0 / 2; s > 32; s>>=1){
+        if(row_idx + lane_id < s){
+            W0_shared[(row_idx + lane_id) * N0 + col_idx] += W0_shared[(row_idx + lane_id + s) * N0 + col_idx];
+        }
+        __syncthreads();
+    }
+
+    if(warp_id < N0){
+        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 32) * N0 + col_idx];
+        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 16) * N0 + col_idx];
+        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 8) * N0 + col_idx];
+        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 4) * N0 + col_idx];
+        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 2) * N0 + col_idx];
+        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 1) * N0 + col_idx];
+    }
+    __syncthreads();
+    // Now the first N0 term of W0_shared stores the output
+    if(threadIdx.x < N0){
+        W0_shared[threadIdx.x] += bias0_shared[threadIdx.x];
+        if(W0_shared[threadIdx.x] < cutlass::half_t(0)){
+            W0_shared[threadIdx.x] = cutlass::half_t(0);
+        }
+    } // relu
+    
+    __pipeline_wait_prior(0);
+    __syncthreads();
+    if(threadIdx.x < K1 * N1){
+        W1_shared[threadIdx.x] *= W0_shared[threadIdx.x / N1];
+    }
+
+    __syncthreads();
+    // another small reduction hard code it
+    // N1 = 64, K1 = 4
+    if(N1 == 64){
+        const int row_idx1 = threadIdx.x / N1;
+        const int col_idx1 = threadIdx.x % N1;
+        if(row_idx1 < 2){
+            W1_shared[col_idx1+row_idx1*N1] +=  W1_shared[col_idx1+(row_idx1+2)*N1];
+        }
+        __syncthreads();
+        if(row_idx1 == 0){
+            W1_shared[col_idx1] += W1_shared[col_idx1 + N1];
+        }
+
+    }
+    
+    // N1 = 128, K1 = 8, num_threads = 1024
+    if(N1 == 128){
+        const int row_idx1 = threadIdx.x / N1;
+        const int col_idx1 = threadIdx.x % N1;
+        if(row_idx1 < 4){
+            W1_shared[col_idx1+row_idx1*N1] +=  W1_shared[col_idx1+(row_idx1+4)*N1];
+            __syncthreads();
+            W1_shared[col_idx1+row_idx1*N1] +=  W1_shared[col_idx1+(row_idx1+2)*N1];
+            __syncthreads();
+            W1_shared[col_idx1+row_idx1*N1] +=  W1_shared[col_idx1+(row_idx1+1)*N1];
+        }
+    }
+
+    __syncthreads();
+    // bias + sigmoid
+    if(threadIdx.x < N1){
+        float tmp = sigmoid_op(static_cast<float>(W1_shared[threadIdx.x] + bias1_shared[threadIdx.x]));
+        W1_shared[threadIdx.x] = static_cast<cutlass::half_t>(tmp);
+    }
+    __syncthreads();
+    // Finally multiply the activation with size (IMG_SIZE, IMG_SIZE, K0)
+    #pragma unroll 8
+    for(int i = 0; i < (IMG_SIZE * IMG_SIZE * K0) / blockDim.x; ++i){
+        const int inner_idx = threadIdx.x + i * blockDim.x;
+        downsampled[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] +=
+            activation[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] *
+            W1_shared[inner_idx % K0];
+    }
+}
+
 template <int N0>
 struct SEb2bGEMMFused{
     static void run(const cutlass::half_t* __restrict__ activation,
@@ -188,8 +359,8 @@ class MyCudaSE{
            downsampled(static_cast<ElementInput*>(downsampled.data_ptr())) {}
 
     void run() {
-        SEb2bGEMMFused_Kernel<N0>
-            <<<128 / 32, 32>>>(activation, W1, bias1, W2, bias2, downsampled);
+        SEb2bGEMMFused_Kernel2<N0>
+            <<<128, 512>>>(activation, W1, bias1, W2, bias2, downsampled);
         cudaError_t err = cudaGetLastError();
         std::cout << cudaGetErrorString(err) << std::endl;
     }
@@ -276,13 +447,13 @@ class ResnetSE {
     // precision?)
     void reduce() {
         cutlass::Status status = reduction.reduce(Squeezed, Activation);
-        if (status != cutlass::Status::kSuccess) {
-            std::cout << cutlass::cutlassGetStatusString(status) << std::endl;
-        }
+        // if (status != cutlass::Status::kSuccess) {
+        //     std::cout << cutlass::cutlassGetStatusString(status) << std::endl;
+        // }
 
 
-        SEb2bGEMMFused<4> b2bgemm_op;
-        b2bgemm_op.run(Squeezed.data(), W1.data(), bias1.data(), W2.data(), bias2.data(),Excited.data());
+        // SEb2bGEMMFused<4> b2bgemm_op;
+        // b2bgemm_op.run(Squeezed.data(), W1.data(), bias1.data(), W2.data(), bias2.data(),Excited.data());
 
 
     }
