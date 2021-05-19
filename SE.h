@@ -22,169 +22,45 @@
     CHECK_CUDA(x);     \
     CHECK_CONTIGUOUS(x)
 
-template <int N0, int K0=N0*16, int N1=K0, int K1 = N0, int Mtile_size=32, int IMG_SIZE=64/N0>
+
+template <int N0, typename HALF_T = at::Half, int K0=N0*16, int N1=K0, int K1 = N0, int Mtile_size=32, int IMG_SIZE=64/N0>
 __global__ void SEb2bGEMMFused_Kernel(
-    const cutlass::half_t* __restrict__ activation,
-    const cutlass::half_t* __restrict__ W0,
-    const cutlass::half_t* __restrict__ bias0,
-    const cutlass::half_t* __restrict__ W1,
-    const cutlass::half_t* __restrict__ bias1,
-    cutlass::half_t* __restrict__ downsampled) {
-    // activation is a tensor of size (128, 16, 16, 64) or (128, 8, 8, 128)
-        
-
-
-    cutlass::epilogue::thread::Sigmoid<float> sigmoid_op;
-
-    constexpr int HALF_T_BANK_PADDING = 2;
-
-
-    cutlass::half_t out0_tile[N0];
-
-    __shared__ cutlass::half_t W0_tile[N0 * K0]; // too large for registers when N0 = 8
-    __shared__ cutlass::half_t
-        A0_tile[Mtile_size * (K0 + HALF_T_BANK_PADDING)];  // add an offset to avoid bank conflict
-
-    for(int i = 0; i < (N0 * K0 / 256); ++i){
-        __pipeline_memcpy_async(&W0_tile[8 * threadIdx.x + i * 256], &W0[8 * threadIdx.x + i * 256], sizeof(cutlass::half_t) * 8);
-
-    }
-    __pipeline_commit();
-    
-    
-    // reduction
-    for (int k = 0; k < K0; ++k) {
-        A0_tile[threadIdx.x * (K0 + HALF_T_BANK_PADDING) + k] =
-            cutlass::half_t(0);
-    }
-
-    for(int j = 0; j < (IMG_SIZE * IMG_SIZE); ++j){
-        #pragma unroll 32
-        for(int k = 0; k < K0; ++k){
-            const int idx = (blockIdx.x * Mtile_size + threadIdx.x) * (IMG_SIZE * IMG_SIZE * K0) + j * K0 + k;
-            A0_tile[threadIdx.x * (K0 + HALF_T_BANK_PADDING) + k] += activation[idx] * static_cast<cutlass::half_t>(1.f/(IMG_SIZE * IMG_SIZE));
-        }
-    }
-
-    __syncthreads(); // there is only one warp...
-    __pipeline_wait_prior(0);
-    // Before starting computation, issue an async memcpy to get a tile from W1,
-    // bias0, bias1
-    __shared__ cutlass::half_t W1_shared[N1 * K1];
-    __shared__ cutlass::half_t bias0_shared[N0];
-    __shared__ cutlass::half_t bias1_shared[N1];
-
-
-    // 256 = 32 threads (1 warp) * 8 half_t per thread
-    for (int i = 0; i < N1 * K1 / 256; i++) {
-        __pipeline_memcpy_async(&W1_shared[8 * threadIdx.x + i * 256],
-                                &W1[8 * threadIdx.x + i * 256],
-                                8 * sizeof(cutlass::half_t));
-    }
-
-    __pipeline_memcpy_async(&bias1_shared[threadIdx.x * (N1/32)], &bias1[threadIdx.x * (N1/32)],
-                            (N1 / 32) * sizeof(cutlass::half_t));
-
-    if (threadIdx.x == 0) {
-        __pipeline_memcpy_async(&bias0_shared[0], &bias0[0],
-                                N0 * sizeof(cutlass::half_t));
-    }
-
-
-    __pipeline_commit();
-
-    // Now start computation
-
-    #pragma unroll N0
-    for (int i = 0; i < N0; ++i) {
-        out0_tile[i] = cutlass::half_t(0);
-    }
-
-    for (int k = 0; k < K0; ++k) {
-        #pragma unroll N0
-        for (int i = 0; i < N0; ++i) {
-            out0_tile[i] +=
-                A0_tile[threadIdx.x * (K0 + HALF_T_BANK_PADDING) + k] * W0_tile[k * N0 + i];
-        }
-    }
-
-    __pipeline_wait_prior(0);
-
-// relu
-    #pragma unroll N0
-    for (int i = 0; i < N0; ++i) {
-        out0_tile[i] = out0_tile[i] + bias0_shared[i];
-        if(out0_tile[i] < cutlass::half_t(0)){
-            out0_tile[i] = cutlass::half_t(0);
-        }
-    }
-
-
-    cutlass::half_t results[N1];
-    for (int k = 0; k < N1; ++k) {
-        // Use float accumulator because pytorch blocks some of the half operators
-        float result = 0.f;
-
-        #pragma unroll K1
-        for (int i = 0; i < K1; ++i) {
-            result += static_cast<float>(
-                out0_tile[i] *
-                W1_shared[i * N1 + k]);  // Broadcast, no bank conflict
-        }
-        result += static_cast<float>(bias1_shared[k]);
-        result = sigmoid_op(result);
-        results[k] = static_cast<cutlass::half_t>(result);
-    }
-
-    for(int j = 0; j < (IMG_SIZE * IMG_SIZE); ++j){
-        #pragma unroll 32
-        for(int k = 0; k < N1; ++k){
-            int idx = (blockIdx.x * Mtile_size + threadIdx.x) * (IMG_SIZE * IMG_SIZE * N1) + j * N1 + k;
-            downsampled[idx] += activation[idx] * results[k];
-        }
-    }
-}
-
-template <int N0, int K0=N0*16, int N1=K0, int K1 = N0, int Mtile_size=32, int IMG_SIZE=64/N0>
-__global__ void SEb2bGEMMFused_Kernel2(
-    const cutlass::half_t* __restrict__ activation,
-    const cutlass::half_t* __restrict__ W0,
-    const cutlass::half_t* __restrict__ bias0,
-    const cutlass::half_t* __restrict__ W1,
-    const cutlass::half_t* __restrict__ bias1,
-    cutlass::half_t* __restrict__ downsampled) {
+    const HALF_T* __restrict__ activation,
+    const HALF_T* __restrict__ W0,
+    const HALF_T* __restrict__ bias0,
+    const HALF_T* __restrict__ W1,
+    const HALF_T* __restrict__ bias1,
+    HALF_T* __restrict__ downsampled) {
     
     const int reduction_thread_per_channel = blockDim.x / K0;
     const int thread_reduction_width = (IMG_SIZE * IMG_SIZE)/reduction_thread_per_channel;
-    __shared__ cutlass::half_t A0_row[K0];
+    __shared__ HALF_T A0_row[K0];
     const int channel_id = threadIdx.x % K0;
     const int start_row_id = (threadIdx.x / K0) * thread_reduction_width;
 
-    cutlass::epilogue::thread::Sigmoid<float> sigmoid_op;
-
-    __shared__ cutlass::half_t W0_shared[N0 * K0];
-    __shared__ cutlass::half_t W1_shared[N1 * K1];
-    __shared__ cutlass::half_t bias0_shared[N0];
-    __shared__ cutlass::half_t bias1_shared[N1];
+    __shared__ HALF_T W0_shared[N0 * K0];
+    __shared__ HALF_T W1_shared[N1 * K1];
+    __shared__ HALF_T bias0_shared[N0];
+    __shared__ HALF_T bias1_shared[N1];
 
 
     // Issue memcpy to get the first weight matrix and bias
     if(threadIdx.x < (N0 * K0)/8){
         __pipeline_memcpy_async(&W0_shared[8 * threadIdx.x],
                                 &W0[8 * threadIdx.x],
-                                8 * sizeof(cutlass::half_t));
+                                8 * sizeof(HALF_T));
     }
 
     // N0 = 4 or 8
     if(threadIdx.x == 0){
         __pipeline_memcpy_async(&bias0_shared[0], &bias0[0],
-                                N0 * sizeof(cutlass::half_t));
+                                N0 * sizeof(HALF_T));
     }
 
     __pipeline_commit();
 
     // Each thread computes part of the channel-wise average
-    cutlass::half_t tmp(0.f);
+    HALF_T tmp(0.f);
     #pragma unroll 16
     for(int i = 0; i < thread_reduction_width; ++i){
         // add (blockIdx.x, start_row_id+i, channel_id)
@@ -192,18 +68,17 @@ __global__ void SEb2bGEMMFused_Kernel2(
     }
 
     if(threadIdx.x < K0){
-        A0_row[threadIdx.x] = cutlass::half_t(0.f);
+        A0_row[threadIdx.x] = HALF_T(0.f);
     }
     __syncthreads();
 
     // Put the partial reduction together
     for(int i = 0; i < reduction_thread_per_channel; ++i){
         if((threadIdx.x / K0) == i){
-            A0_row[channel_id] += tmp * static_cast<cutlass::half_t>(1.f/(IMG_SIZE * IMG_SIZE));
+            A0_row[channel_id] += tmp * static_cast<HALF_T>(1.f/(IMG_SIZE * IMG_SIZE));
         }
         __syncthreads();
     }
-
     // Wait until W0, bias0 arrives
     __pipeline_wait_prior(0);
 
@@ -211,14 +86,14 @@ __global__ void SEb2bGEMMFused_Kernel2(
     if(threadIdx.x < (N1 * K1)/8){
         __pipeline_memcpy_async(&W1_shared[8 * threadIdx.x],
                                 &W1[8 * threadIdx.x],
-                                8 * sizeof(cutlass::half_t));
+                                8 * sizeof(HALF_T));
     }
     
 
     // Need to confirm this, if send k byte then input must be k-aligned?
     if(threadIdx.x < (N1 / 4)){
         __pipeline_memcpy_async(&bias1_shared[4 * threadIdx.x], &bias1[4 * threadIdx.x],
-                                4 * sizeof(cutlass::half_t));
+                                4 * sizeof(HALF_T));
     }
 
 
@@ -266,8 +141,8 @@ __global__ void SEb2bGEMMFused_Kernel2(
     // Now the first N0 term of W0_shared stores the output
     if(threadIdx.x < N0){
         W0_shared[threadIdx.x] += bias0_shared[threadIdx.x];
-        if(W0_shared[threadIdx.x] < cutlass::half_t(0)){
-            W0_shared[threadIdx.x] = cutlass::half_t(0);
+        if(W0_shared[threadIdx.x] < HALF_T(0)){
+            W0_shared[threadIdx.x] = HALF_T(0);
         }
     } // relu
     
@@ -311,8 +186,8 @@ __global__ void SEb2bGEMMFused_Kernel2(
     __syncthreads();
     // bias + sigmoid
     if(threadIdx.x < N1){
-        float tmp = sigmoid_op(static_cast<float>(W1_shared[threadIdx.x] + bias1_shared[threadIdx.x]));
-        W1_shared[threadIdx.x] = static_cast<cutlass::half_t>(tmp);
+        HALF_T tmp = W1_shared[threadIdx.x] + bias1_shared[threadIdx.x];
+        W1_shared[threadIdx.x] = 1.0/(1.0 + exp(-tmp));
     }
     __syncthreads();
     // Finally multiply the activation with size (IMG_SIZE, IMG_SIZE, K0)
@@ -326,26 +201,13 @@ __global__ void SEb2bGEMMFused_Kernel2(
     }
 }
 
-template <int N0>
-struct SEb2bGEMMFused{
-    static void run(const cutlass::half_t* __restrict__ activation,
-                    const cutlass::half_t* __restrict__ W0,
-                    const cutlass::half_t* __restrict__ bias0,
-                    const cutlass::half_t* __restrict__ W1,
-                    const cutlass::half_t* __restrict__ bias1,
-                    cutlass::half_t* __restrict__ downsampled) {
-        SEb2bGEMMFused_Kernel<N0>
-            <<<128 / 32, 32>>>(activation, W0, bias0, W1, bias1, downsampled);
-        cudaError_t err = cudaGetLastError();
-        std::cout << cudaGetErrorString(err) << std::endl;
-    }
-};
 
 
 template <int N0>
 class MyCudaSE{
 
-    using ElementInput = cutlass::half_t;
+    // using ElementInput = cutlass::half_t;
+    using ElementInput = at::Half;
 
     ElementInput* activation;
     ElementInput* W1;
@@ -366,10 +228,12 @@ class MyCudaSE{
            bias1(static_cast<ElementInput*>(bias1.data_ptr())),
            W2(static_cast<ElementInput*>(W2.data_ptr())),
            bias2(static_cast<ElementInput*>(bias2.data_ptr())),
-           downsampled(static_cast<ElementInput*>(downsampled.data_ptr())) {}
+           downsampled(static_cast<ElementInput*>(downsampled.data_ptr())) {
+               static_assert((N0 == 4) || (N0 == 8));
+           }
 
     void run() {
-        SEb2bGEMMFused_Kernel2<N0>
+        SEb2bGEMMFused_Kernel<N0, ElementInput>
             <<<128, 512>>>(activation, W1, bias1, W2, bias2, downsampled);
         cudaError_t err = cudaGetLastError();
         std::cout << cudaGetErrorString(err) << std::endl;

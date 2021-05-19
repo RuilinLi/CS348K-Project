@@ -31,12 +31,12 @@ device=torch.device("cuda")
 all_size = [(128, 16, 16, 64), (128, 8, 8, 128)]
 ind = 1
 use_size = all_size[ind]
-Activation = torch.ones(use_size, dtype=torch.float16, device=device) * 0.1
+Activation = torch.rand(use_size, dtype=torch.float16, device=device)
 # Squeezed = torch.zeros((128, 64), dtype=torch.float16, device=device)
-W1 = torch.ones((use_size[-1], use_size[-1]//16), dtype=torch.float16, device=device)* 0.1
-b1 = torch.ones((use_size[-1]//16), dtype=torch.float16, device=device)* 0.1
-W2 = torch.ones((use_size[-1]//16, use_size[-1]), dtype=torch.float16, device=device)* 0.1
-b2 = torch.zeros((use_size[-1]), dtype=torch.float16, device=device) * 0.1
+W1 = torch.randn((use_size[-1], use_size[-1]//16), dtype=torch.float16, device=device)
+b1 = torch.randn((use_size[-1]//16), dtype=torch.float16, device=device)
+W2 = torch.randn((use_size[-1]//16, use_size[-1]), dtype=torch.float16, device=device)
+b2 = torch.zeros((use_size[-1]), dtype=torch.float16, device=device)
 result = torch.zeros(use_size,dtype=torch.float16, device=device)
 obj = conv_cuda.MyCudaSE(Activation, W1, b1, W2, b2, result)
 obj.run()
@@ -53,6 +53,10 @@ ref = F.relu(torch.matmul(reduced, W1) + b1)
 ref = torch.matmul(ref, W2) + b2
 ref = torch.sigmoid(ref)
 ref = Activation * ref.unsqueeze(1).unsqueeze(1)
+
+print((result - ref).max())
+print((result - ref).min())
+print((result - ref).abs().mean())
 
 
 # out3 = torch.zeros((128, 64), dtype=torch.float16, device=device)
