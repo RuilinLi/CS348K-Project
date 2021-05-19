@@ -245,22 +245,23 @@ __global__ void SEb2bGEMMFused_Kernel2(
 
     __syncthreads();
     // Reduction
-    for(unsigned int s = K0 / 2; s > 32; s>>=1){
+    for(unsigned int s = K0 / 2; s > 0; s>>=1){
         if(row_idx + lane_id < s){
             W0_shared[(row_idx + lane_id) * N0 + col_idx] += W0_shared[(row_idx + lane_id + s) * N0 + col_idx];
         }
         __syncthreads();
     }
 
-    if(warp_id < N0){
-        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 32) * N0 + col_idx];
-        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 16) * N0 + col_idx];
-        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 8) * N0 + col_idx];
-        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 4) * N0 + col_idx];
-        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 2) * N0 + col_idx];
-        W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 1) * N0 + col_idx];
-    }
-    __syncthreads();
+    // For some reason this warp level reduction didn't work...
+    // if(warp_id < N0){
+    //     W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 32) * N0 + col_idx];
+    //     W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 8) * N0 + col_idx];
+    //     W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 4) * N0 + col_idx];
+    //     W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 2) * N0 + col_idx];
+    //     W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 1) * N0 + col_idx];
+    // }
+    // __syncthreads();
+
     // Now the first N0 term of W0_shared stores the output
     if(threadIdx.x < N0){
         W0_shared[threadIdx.x] += bias0_shared[threadIdx.x];

@@ -48,12 +48,11 @@ obj.run()
 # obj.run()
 
 
-# reduced = torch.sum(torch.sum(Activation, 1), 1)
-# ref = Activation * reduced.unsqueeze(1).unsqueeze(1)
-# ref = F.relu(torch.matmul(reduced, W1) + b1)
-# ref = torch.matmul(ref, W2) + b2
-# ref = torch.sigmoid(ref)
-# ref = Activation * ref.unsqueeze(1).unsqueeze(1) + 0.1
+reduced = torch.sum(torch.sum(Activation, 1), 1) / (use_size[1] * use_size[2])
+ref = F.relu(torch.matmul(reduced, W1) + b1)
+ref = torch.matmul(ref, W2) + b2
+ref = torch.sigmoid(ref)
+ref = Activation * ref.unsqueeze(1).unsqueeze(1)
 
 
 # out3 = torch.zeros((128, 64), dtype=torch.float16, device=device)
