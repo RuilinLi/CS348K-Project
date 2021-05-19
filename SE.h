@@ -251,7 +251,8 @@ __global__ void SEb2bGEMMFused_Kernel2(
         }
         __syncthreads();
     }
-
+    // TODO: it's probably better to map each warp to a 16 x 2 tile in W0_shared to get better bandwidth utilization and remove
+    // the bank conflict above. Not sure if this fix will be too important since global memory access latency seems to dominate in this kernel. 
     // For some reason this warp level reduction didn't work...
     // if(warp_id < N0){
     //     W0_shared[(lane_id) * N0 + col_idx] += W0_shared[(lane_id + 32) * N0 + col_idx];
