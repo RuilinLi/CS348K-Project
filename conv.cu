@@ -14,10 +14,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::init<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                      torch::Tensor, torch::Tensor>())
         .def("run", &MyCudaSE<8>::run);
-    
-    py::class_<ResnetSE>(m, "ResnetSE")
+
+    py::class_<MyCudaSE2<16>>(m, "MyCudaSE2")
         .def(
             py::init<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-                     torch::Tensor, torch::Tensor, torch::Tensor>())
-        .def("run", &ResnetSE::reduce);
+                     torch::Tensor, torch::Tensor>())
+        .def("run", &MyCudaSE2<16>::run);
+    
+
+
+
 }
