@@ -59,34 +59,38 @@ if False:
 
 ################## Larger SE
 if True:
+    print(0)
+#all_size = [(128, 4, 4, 256), (128, 2, 2, 512)]
+all_size = [(1024, 4, 4, 256), (1024, 2, 2, 512)]
 
-    all_size = [(128, 4, 4, 256), (128, 2, 2, 512)]
-    ind = 0
-    use_size = all_size[ind]
-    Activation = torch.ones(use_size, dtype=torch.float16, device=device) * 0.01
-    # Squeezed = torch.zeros((128, 64), dtype=torch.float16, device=device)
-    W1 = torch.ones((use_size[-1], use_size[-1]//16), dtype=torch.float16, device=device) * 0.01
-    b1 = torch.ones((use_size[-1]//16), dtype=torch.float16, device=device) * 0.01
-    W2 = torch.ones((use_size[-1]//16, use_size[-1]), dtype=torch.float16, device=device)
-    b2 = torch.ones((use_size[-1]), dtype=torch.float16, device=device)
-    result = torch.zeros(use_size,dtype=torch.float16, device=device)
-    obj = conv_cuda.MyCudaSE2(Activation, W1, b1, W2, b2, result)
-    obj.run()
-    # obj.run()
-    # obj.run()
-    # print(result.max())
-    # print(result.min())
-    # obj = conv_cuda.ResnetSE(Activation, Squeezed, W1, b1, W2, b2, result)
-    # obj.run()
+ind = 0
+use_size = all_size[ind]
+#Activation = torch.ones(use_size, dtype=torch.float16, device=device) * 0.5
+Activation = torch.rand(use_size, dtype=torch.float16, device=device)
+
+W1 = torch.randn((use_size[-1], use_size[-1]//16), dtype=torch.float16, device=device)
+b1 = torch.randn((use_size[-1]//16), dtype=torch.float16, device=device)
+W2 = torch.randn((use_size[-1]//16, use_size[-1]), dtype=torch.float16, device=device)
+b2 = torch.randn((use_size[-1]), dtype=torch.float16, device=device)
+result = torch.zeros(use_size,dtype=torch.float16, device=device)
+obj = conv_cuda.MyCudaSE2(Activation, W1, b1, W2, b2, result)
+obj.run()
 
 
-# reduced = torch.sum(torch.sum(Activation, 1), 1) / (use_size[1] * use_size[2])
-# ref = F.relu(torch.matmul(reduced, W1) + b1)
-# ref = torch.matmul(ref, W2) + b2
-# ref = torch.sigmoid(ref)
-# ref = Activation * ref.unsqueeze(1).unsqueeze(1)
+reduced = torch.sum(torch.sum(Activation, 1), 1) / (use_size[1] * use_size[2])
+ref = F.relu(torch.matmul(reduced, W1) + b1)
 
-# print((result - ref).max())
-# print((result - ref).min())
-# print((result - ref).abs().mean())
+ref = torch.matmul(ref, W2) + b2
+ref = torch.sigmoid(ref)
+ref = Activation * ref.unsqueeze(1).unsqueeze(1)
 
+print((result - ref).max())
+print((result - ref).min())
+print((result - ref).abs().mean())
+
+
+# res_local = result[512:(5*128)]
+# ref_local = ref[512:(5*128)]
+# torch.argmax(res_local - ref_local)
+# torch.argmin(ref_local - res_local)
+# print((res_local - ref_local).max())

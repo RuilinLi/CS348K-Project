@@ -195,10 +195,10 @@ __global__ void SEb2bGEMMFused_Kernel(
 
 template <int N0,
           typename HALF_T = at::Half,
+          int warp_M = 16,
           int K0 = N0 * 16,
           int N1 = K0,
           int K1 = N0,
-          int warp_M = 16,
           int IMG_SIZE = 64 / N0>
 __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
     const HALF_T* __restrict__ activation,
@@ -320,11 +320,11 @@ __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
             W0_shared[threadIdx.x] = HALF_T(0);
         }
     } // Relu done
-    __syncthreads();
-    __pipeline_wait_prior(0);
     
+    __pipeline_wait_prior(0);
+    __syncthreads();
     // Second GEMM col_start in Activation is the same as in W1
-    wmma::fill_fragment(acc_frag, *reinterpret_cast<const half*>(&zero));
+    // wmma::fill_fragment(acc_frag, *reinterpret_cast<const half*>(&zero));
 
     // Hard code for each of the two cases
     if(warp_N == 32){
@@ -334,6 +334,7 @@ __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
         half *W1_cuda_half_ptr = reinterpret_cast<half*>(W1_shared + second_half * warp_K * N1 + local_col_start);
         wmma::load_matrix_sync(a_frag, activation1_cuda_half_ptr, K1);
         wmma::load_matrix_sync(b_frag, W1_cuda_half_ptr, N1);
+        wmma::fill_fragment(acc_frag, *reinterpret_cast<const half*>(&zero));
         wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         wmma::store_matrix_sync(W1_cuda_half_ptr, acc_frag, N1, wmma::mem_row_major);
 
@@ -353,6 +354,7 @@ __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
         half *W1_cuda_half_ptr = reinterpret_cast<half*>(W1_shared + warp_id * warp_N);
         wmma::load_matrix_sync(a_frag, activation1_cuda_half_ptr, K1);
         wmma::load_matrix_sync(b_frag, W1_cuda_half_ptr, N1);
+        wmma::fill_fragment(acc_frag, *reinterpret_cast<const half*>(&zero));
         wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         wmma::store_matrix_sync(W1_cuda_half_ptr, acc_frag, N1, wmma::mem_row_major);
 
@@ -366,17 +368,30 @@ __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
 
     __syncthreads();
 
-    // Finally multiply the activation with size (IMG_SIZE, IMG_SIZE, K0)
-    // (IMG_SIZE * IMG_SIZE * K0) must be an integer multiple of blockDim.x
-    #pragma unroll 2
-    for(int i = 0; i < (IMG_SIZE * IMG_SIZE * K0) / blockDim.x; ++i){
-        const int inner_idx = threadIdx.x + i * blockDim.x;
-        downsampled[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] +=
-            activation[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] *
-            W1_shared[inner_idx % K0];
+
+    for(int i = 0; i < (warp_M * N1)/blockDim.x; ++i){
+        const int local_n = (threadIdx.x + i * blockDim.x) / N1;
+        const int n = row_start + local_n;
+        const int c = (threadIdx.x + i * blockDim.x) % N1;
+        
+        #pragma unroll (IMG_SIZE * IMG_SIZE)
+        for (int j = 0; j < (IMG_SIZE * IMG_SIZE); ++j) {
+            downsampled[n * IMG_SIZE * IMG_SIZE * N1 + j * N1 + c] +=
+                activation[n * IMG_SIZE * IMG_SIZE * N1 + j * N1 + c] *
+                W1_shared[local_n * N1 + c];
+        }
     }
 
-
+    // Finally multiply the activation with size (warp_M, IMG_SIZE, IMG_SIZE, K0)
+    // (warp_M * IMG_SIZE * IMG_SIZE * K0) must be an integer multiple of blockDim.x
+    // #pragma unroll 16
+    // for(int i = 0; i < (IMG_SIZE * IMG_SIZE * K0 * warp_M) / blockDim.x; ++i){
+    //     const int inner_idx = threadIdx.x + i * blockDim.x;
+    //     downsampled[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] +=
+    //         activation[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] *
+    //         W1_shared[inner_idx % K0];
+    //     // downsampled[blockIdx.x * warp_M * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] = HALF_T(0.123f);
+    // }TORCH_CUDA_ARCH_LIST="7.0"
 }
 
 template <int N0>
@@ -448,20 +463,29 @@ class MyCudaSE2{
            }
 
     void run() {
-        int warp_M = 16;
-        if(N0 == 32){
-            warp_M = 8;
-        }
-        const int n = 128;
-        const int channel = 256;
-        const int n_threads = (channel/16) * 32;
-
-        SEb2bGEMMFused_Tensor_Core_Kernel<N0, ElementInput>
+        constexpr int n = 1024;
+        if (N0 == 16){
+            constexpr int warp_M = 16;
+            constexpr int channels = 256;
+            constexpr int n_threads = (channels / 16) * 32;
+            SEb2bGEMMFused_Tensor_Core_Kernel<N0, ElementInput>
             <<<n/warp_M, n_threads>>>(activation, W1, bias1, W2, bias2, downsampled);
+
+
+        }
+        if (N0 == 32){
+            constexpr int warp_M = 8;
+            constexpr int channels = 512;
+            constexpr int n_threads = (channels / 16) * 32;
+            SEb2bGEMMFused_Tensor_Core_Kernel<N0, ElementInput, warp_M>
+            <<<n/warp_M, n_threads>>>(activation, W1, bias1, W2, bias2, downsampled);
+        }
         cudaError_t err = cudaGetLastError();
         std::cout << cudaGetErrorString(err) << std::endl;
     }
 };
+
+
 
 // To start off assume input has dimension (128, 16, 16, 64)
 // To use cutlass reduction, interpret as a (1, 128,  256, 64) tensor
