@@ -80,6 +80,8 @@ obj.run()
 reduced = torch.sum(torch.sum(Activation, 1), 1) / (use_size[1] * use_size[2])
 ref = F.relu(torch.matmul(reduced, W1) + b1)
 
+
+
 ref = torch.matmul(ref, W2) + b2
 ref = torch.sigmoid(ref)
 ref = Activation * ref.unsqueeze(1).unsqueeze(1)
@@ -87,6 +89,7 @@ ref = Activation * ref.unsqueeze(1).unsqueeze(1)
 print((result - ref).max())
 print((result - ref).min())
 print((result - ref).abs().mean())
+
 
 
 # res_local = result[512:(5*128)]
