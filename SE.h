@@ -30,6 +30,7 @@ __global__ void SEb2bGEMMFused_Kernel(
     const HALF_T* __restrict__ bias0,
     const HALF_T* __restrict__ W1,
     const HALF_T* __restrict__ bias1,
+    const HALF_T* __restrict__ next_fixup_bias1a_ptr,
     HALF_T* __restrict__ downsampled) {
     
     const int reduction_thread_per_channel = blockDim.x / K0;
@@ -184,12 +185,15 @@ __global__ void SEb2bGEMMFused_Kernel(
     __syncthreads();
     // Finally multiply the activation with size (IMG_SIZE, IMG_SIZE, K0)
     // (IMG_SIZE * IMG_SIZE * K0) must be an integer multiple of blockDim.x
+
+    const HALF_T next_fixup_bias1a = *next_fixup_bias1a_ptr;
+
     #pragma unroll 8
     for(int i = 0; i < (IMG_SIZE * IMG_SIZE * K0) / blockDim.x; ++i){
         const int inner_idx = threadIdx.x + i * blockDim.x;
         downsampled[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] +=
             activation[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] *
-            W1_shared[inner_idx % K0];
+            W1_shared[inner_idx % K0] + next_fixup_bias1a;
     }
 }
 
@@ -206,6 +210,7 @@ __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
     const HALF_T* __restrict__ bias0,
     const HALF_T* __restrict__ W1,
     const HALF_T* __restrict__ bias1,
+    const HALF_T* __restrict__ next_fixup_bias1a_ptr,
     HALF_T* __restrict__ downsampled) {
     // In this kernel N0 is at least 16, we can use Tensor core to compute the two GEMM
     // Each threadblock is responsible for 16 sub-samples
@@ -382,6 +387,7 @@ __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
 
     __syncthreads();
 
+    const HALF_T next_fixup_bias1a = (N0==16)?(*next_fixup_bias1a_ptr):(HALF_T(0));
 
     for(int i = 0; i < (warp_M * N1)/blockDim.x; ++i){
         const int local_n = (threadIdx.x + i * blockDim.x) / N1;
@@ -392,9 +398,78 @@ __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
         for (int j = 0; j < (IMG_SIZE * IMG_SIZE); ++j) {
             downsampled[n * IMG_SIZE * IMG_SIZE * N1 + j * N1 + c] +=
                 activation[n * IMG_SIZE * IMG_SIZE * N1 + j * N1 + c] *
-                W1_shared[local_n * N1 + c];
+                W1_shared[local_n * N1 + c] + next_fixup_bias1a;
         }
     }
+}
+
+template <int N0>
+void SE(torch::Tensor Activation,
+        torch::Tensor W1,
+        torch::Tensor bias1,
+        torch::Tensor W2,
+        torch::Tensor bias2,
+        torch::Tensor next_fixup_bias1a,
+        torch::Tensor downsampled) {
+    static_assert(N0 == 4 || N0 == 8, "N0 must be one of {4, 8}");
+
+    using ElementInput = at::Half;
+    ElementInput* act_ptr = static_cast<ElementInput*>(Activation.data_ptr());
+    ElementInput* W1_ptr = static_cast<ElementInput*>(W1.data_ptr());
+    ElementInput* bias1_ptr = static_cast<ElementInput*>(bias1.data_ptr());
+    ElementInput* W2_ptr = static_cast<ElementInput*>(W2.data_ptr());
+    ElementInput* bias2_ptr = static_cast<ElementInput*>(bias2.data_ptr());
+    ElementInput* downsampled_ptr = static_cast<ElementInput*>(downsampled.data_ptr());
+    ElementInput* next_fixup_bias1a_ptr = static_cast<ElementInput*>(next_fixup_bias1a.data_ptr());
+    const int batch_size = Activation.size(0);
+
+    SEb2bGEMMFused_Kernel<N0, ElementInput><<<batch_size, 512>>>(
+        act_ptr, W1_ptr, bias1_ptr, W2_ptr, bias2_ptr, next_fixup_bias1a_ptr, downsampled_ptr);
+
+    cudaError_t err = cudaGetLastError();
+    std::cout << cudaGetErrorString(err) << std::endl;
+}
+
+template <int N0>
+void SE_Tensor_Core(torch::Tensor Activation,
+                    torch::Tensor W1,
+                    torch::Tensor bias1,
+                    torch::Tensor W2,
+                    torch::Tensor bias2,
+                    torch::Tensor next_fixup_bias1a,
+                    torch::Tensor downsampled) {
+    static_assert(N0 == 16 || N0 == 32, "N0 must be one of {4, 8}");
+
+    using ElementInput = at::Half;
+    ElementInput* act_ptr = static_cast<ElementInput*>(Activation.data_ptr());
+    ElementInput* W1_ptr = static_cast<ElementInput*>(W1.data_ptr());
+    ElementInput* bias1_ptr = static_cast<ElementInput*>(bias1.data_ptr());
+    ElementInput* W2_ptr = static_cast<ElementInput*>(W2.data_ptr());
+    ElementInput* bias2_ptr = static_cast<ElementInput*>(bias2.data_ptr());
+    ElementInput* next_fixup_bias1a_ptr = nullptr;
+    if(N0 == 16){
+        next_fixup_bias1a_ptr = static_cast<ElementInput*>(next_fixup_bias1a.data_ptr());
+    }
+    ElementInput* downsampled_ptr =
+        static_cast<ElementInput*>(downsampled.data_ptr());
+    const int batch_size = Activation.size(0);
+
+    constexpr int warp_M = (N0 == 16)?16:8;
+    constexpr int channels = (N0 == 16)?256:512;
+    constexpr int n_threads = (channels / 16) * 32;
+    constexpr int maxbytes = (N0 == 16)?0x6400:0x18000;
+    if (N0 == 32) {
+        cudaFuncSetAttribute(
+            SEb2bGEMMFused_Tensor_Core_Kernel<N0, ElementInput, warp_M>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes);
+    }
+    // 96KB of shared memory requires Volta and Ampere architecture
+    // (cc 7.0, 8.0, 8.6)
+    SEb2bGEMMFused_Tensor_Core_Kernel<N0, ElementInput, warp_M>
+        <<<batch_size / warp_M, n_threads, maxbytes>>>(
+            act_ptr, W1_ptr, bias1_ptr, W2_ptr, bias2_ptr, next_fixup_bias1a_ptr, downsampled_ptr);
+    cudaError_t err = cudaGetLastError();
+    std::cout << cudaGetErrorString(err) << std::endl;
 }
 
 template <int N0>
