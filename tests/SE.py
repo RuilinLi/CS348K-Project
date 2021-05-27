@@ -10,7 +10,7 @@ if len(sys.argv) < 2:
 else:
     blockIdx = int(sys.argv[1])
     assert blockIdx >= 1 and blockIdx <= 4
-    print(blockIdx)
+
 
 device=torch.device("cuda")
 
@@ -19,12 +19,25 @@ all_size = [(batch_size, 16, 16, 64), (batch_size, 8, 8, 128), (batch_size, 4, 4
 ind = blockIdx
 use_size = all_size[ind - 1]
 
-Activation = torch.rand(use_size, dtype=torch.float16, device=device)
+Activation = torch.empty(use_size, dtype=torch.float16, device=device)
+torch.bernoulli(torch.ones_like(Activation) * 0.5, out = Activation)
+Activation = Activation - 0.5
 
-W1 = torch.randn((use_size[-1], use_size[-1]//16), dtype=torch.float16, device=device)
-b1 = torch.randn((use_size[-1]//16), dtype=torch.float16, device=device)
-W2 = torch.randn((use_size[-1]//16, use_size[-1]), dtype=torch.float16, device=device)
-b2 = torch.randn((use_size[-1]), dtype=torch.float16, device=device)
+
+W1 = torch.empty((use_size[-1], use_size[-1]//16), dtype=torch.float16, device=device)
+b1 = torch.empty((use_size[-1]//16), dtype=torch.float16, device=device)
+W2 = torch.empty((use_size[-1]//16, use_size[-1]), dtype=torch.float16, device=device)
+b2 = torch.empty((use_size[-1]), dtype=torch.float16, device=device)
+torch.bernoulli(torch.ones_like(W1) * 0.5, out = W1)
+torch.bernoulli(torch.ones_like(b1) * 0.5, out = b1)
+torch.bernoulli(torch.ones_like(W2) * 0.5, out = W2)
+torch.bernoulli(torch.ones_like(b2) * 0.5, out = b2)
+W1 = W1 - 0.5
+b1 = b1 - 0.5
+W2 = W2 - 0.5
+b2 = b2 - 0.5
+
+
 fixup_bias = torch.randn(1, dtype=torch.float16, device=device)
 result = torch.zeros(use_size, dtype=torch.float16, device=device)
 if blockIdx == 1:

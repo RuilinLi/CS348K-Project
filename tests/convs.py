@@ -24,14 +24,25 @@ stride = 1 if blockIdx == 1 else 2
 out_plane_size = out_use[1]
 
 
-activations = torch.rand(activation_use, dtype=torch.float16, device=device) 
-filter1 = torch.randn((out_channel, 3,3, in_channel), dtype=torch.float16, device=device)
-filter2 = torch.randn((out_channel, 3,3, out_channel), dtype=torch.float16, device=device)
+activations = torch.empty(activation_use, dtype=torch.float16, device=device)
+torch.bernoulli(torch.ones_like(activations) * 0.5, out = activations)
+activations = activations - 0.5
+filter1 = torch.empty((out_channel, 3,3, in_channel), dtype=torch.float16, device=device)
+filter2 = torch.empty((out_channel, 3,3, out_channel), dtype=torch.float16, device=device)
+torch.bernoulli(torch.ones_like(filter1) * 0.5, out = filter1)
+torch.bernoulli(torch.ones_like(filter2) * 0.5, out = filter2)
+filter1 = filter1 - 0.5
+filter2 = filter2 - 0.5
 
-bias1b = torch.randn((1), dtype=torch.float16, device=device)
-bias2a = torch.randn((1), dtype=torch.float16, device=device)
-bias2b = torch.randn((1), dtype=torch.float16, device=device)
-fescale = torch.randn((1), dtype=torch.float16, device=device)
+bias1b = torch.empty((1), dtype=torch.float16, device=device)
+bias2a = torch.empty((1), dtype=torch.float16, device=device)
+bias2b = torch.empty((1), dtype=torch.float16, device=device)
+fescale = torch.empty((1), dtype=torch.float16, device=device)
+
+torch.bernoulli(torch.ones_like(bias1b) * 0.5, out = bias1b)
+torch.bernoulli(torch.ones_like(bias2a) * 0.5, out = bias2a)
+torch.bernoulli(torch.ones_like(bias2b) * 0.5, out = bias2b)
+torch.bernoulli(torch.ones_like(fescale) * 0.5, out = fescale)
 
 
 out1 = torch.zeros((batch_size, out_plane_size, out_plane_size, out_channel), dtype=torch.float16, device=device)
