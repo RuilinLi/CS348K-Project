@@ -33,4 +33,4 @@ bias2a = torch.randn((1), dtype=torch.float16, device=device)
 bias2b = torch.randn((1), dtype=torch.float16, device=device)
 fescale = torch.randn((1), dtype=torch.float16, device=device)
 
-Param1 = conv_cuda.NetParameters(filter1, filter2, bias1b, bias2a, bias2b, fescale)
+Param1 = conv_cuda.NetParameters(filter1, filter2, bias1b, bias2a, bias2b, fescale,activations,activations,activations,activations,activations,activations)

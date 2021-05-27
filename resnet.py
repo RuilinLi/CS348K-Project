@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
 import numpy as np
+import conv_cuda
 
 
 def standardize_weights(w):
@@ -657,3 +658,142 @@ def se_resnet9_fixup(in_channels, base_planes, ngroups):
         [1, 1, 1, 1],
         use_normalization=False,
     )
+
+
+
+class my_se_resnet9_fixup:
+    def __init__(self, net, batch_size):
+        assert batch_size % 128 == 0
+        self.batch_size = batch_size
+        self.all_params = []
+        self.stem_weight = net.state_dict()["stem.1.weight"]
+        self.first_fixup = net.state_dict()["layers.0.0.fixup_bias1a"]
+
+        # I didn't implement downsample (yet)
+        self.downsample_params = []
+        for i in range(4):
+            prefix = "layers.{}.0.".format(i)
+            out_img_size = 16//(2**i)
+            out_channel = 64 * (2 ** i)
+            # probably need to change device if training with multiple GPUs
+            # These buffers should be reused if we want to save memory
+            ConvOut1 = torch.empty((batch_size, out_img_size, out_img_size, out_channel), dtype=torch.float16, device= torch.device("cuda"))
+            ConvOut2 = torch.empty_like(ConvOut1)
+            local_params = [net.state_dict()[prefix+"conv1.weight"].permute(0,2,3,1).contiguous(), # My implementation needs NHWC layout. These filters are NCHW
+                            ConvOut1,
+                            net.state_dict()[prefix+"conv2.weight"].permute(0,2,3,1).contiguous(),
+                            ConvOut2,
+                            net.state_dict()[prefix+"fixup_bias1b"],
+                            net.state_dict()[prefix+"fixup_bias2a"],
+                            net.state_dict()[prefix+"fixup_bias2b"],
+                            net.state_dict()[prefix+"se.excite.0.weight"],
+                            net.state_dict()[prefix+"se.excite.0.bias"],
+                            net.state_dict()[prefix+"se.excite.2.weight"],
+                            net.state_dict()[prefix+"se.excite.2.bias"],
+                            net.state_dict()[prefix+"fixup_scale"]]
+            if i != 3:
+                local_params = local_params + [net.state_dict()["layers.{}.0.".format(i+1)+"fixup_bias1a"]]
+            self.all_params.append(conv_cuda.NetParameters(*local_params))
+            if i != 0:
+                self.downsample_params.append(net.state_dict()[prefix+"downsample.1.weight"])
+
+
+    def SpaceToDepth(self, x):
+        N, C, H, W = x.size()
+        x = x.view(N, C, H // 4, 4, W // 4, 4)
+        x = x.permute(0, 3, 5, 1, 2, 4)
+        x = x.reshape(N, C * 16, H // 4, W // 4)
+        return x
+    
+    def RunNCHWInput(self, input):
+        # both input and stem_weight here are NCHW
+        assert input.size(0) == self.batch_size
+        NHWC_input = F.conv2d(self.SpaceToDepth(input), self.stem_weight).permute(0, 2, 3, 1).contiguous()
+        NHWC_input = F.relu(NHWC_input) + self.first_fixup
+
+
+
+        # Modifies self.all_params[0].ConvOut2
+        blockIdx = 0
+        conv_cuda.Conv2Block1(NHWC_input, self.all_params[blockIdx].Filter1, self.all_params[blockIdx].ConvOut1, self.all_params[blockIdx].Filter2, self.all_params[blockIdx].ConvOut2,
+                              self.all_params[blockIdx].fixup_bias1b, self.all_params[blockIdx].fixup_bias2a, self.all_params[blockIdx].fixup_bias2b, self.all_params[blockIdx].fixup_scale)
+        # No downsample in first iter
+        # Modifies NHWC_input
+        conv_cuda.SE1(self.all_params[blockIdx].ConvOut2, self.all_params[blockIdx].SE_W1, self.all_params[blockIdx].SE_b1,
+                      self.all_params[blockIdx].SE_W2, self.all_params[blockIdx].SE_b2,  self.all_params[blockIdx].next_fixup_bias1a, NHWC_input)
+        
+
+
+        blockIdx += 1
+        out_img_size = 8
+        out_channel_size = 128
+        in_channel_size = 64
+        conv_cuda.Conv2Block2(NHWC_input, self.all_params[blockIdx].Filter1, self.all_params[blockIdx].ConvOut1, self.all_params[blockIdx].Filter2, self.all_params[blockIdx].ConvOut2,
+                              self.all_params[blockIdx].fixup_bias1b, self.all_params[blockIdx].fixup_bias2a, self.all_params[blockIdx].fixup_bias2b, self.all_params[blockIdx].fixup_scale)
+
+        ## I should probably implement Avgpool2d in CUDA
+        NHWC_input = F.avg_pool2d(NHWC_input.permute(0, 3, 1, 2), 3, stride=2, padding=1).permute(0, 2, 3, 1)
+
+        # 1x1 convolution equivalent to matrix multiplication
+        NHWC_input = torch.matmul(NHWC_input.view(self.batch_size * out_img_size * out_img_size, in_channel_size), torch.transpose(
+            self.downsample_params[blockIdx-1].view(out_channel_size, in_channel_size), 1, 0)).view(self.batch_size, out_img_size, out_img_size, out_channel_size)
+
+
+        conv_cuda.SE2(self.all_params[blockIdx].ConvOut2, self.all_params[blockIdx].SE_W1, self.all_params[blockIdx].SE_b1,
+                      self.all_params[blockIdx].SE_W2, self.all_params[blockIdx].SE_b2,  self.all_params[blockIdx].next_fixup_bias1a, NHWC_input)
+
+
+
+
+        # block 3
+        blockIdx += 1
+        out_img_size = 4
+        out_channel_size *= 2
+        in_channel_size *= 2
+
+        conv_cuda.Conv2Block3(NHWC_input, self.all_params[blockIdx].Filter1, self.all_params[blockIdx].ConvOut1, self.all_params[blockIdx].Filter2, self.all_params[blockIdx].ConvOut2,
+                              self.all_params[blockIdx].fixup_bias1b, self.all_params[blockIdx].fixup_bias2a, self.all_params[blockIdx].fixup_bias2b, self.all_params[blockIdx].fixup_scale)
+
+        ## I should probably implement Avgpool2d in CUDA
+        NHWC_input = F.avg_pool2d(NHWC_input.permute(0, 3, 1, 2), 3, stride=2, padding=1).permute(0, 2, 3, 1)
+
+
+
+        # 1x1 convolution equivalent to matrix multiplication
+        NHWC_input = torch.matmul(NHWC_input.view(self.batch_size * out_img_size * out_img_size, in_channel_size), torch.transpose(
+            self.downsample_params[blockIdx-1].view(out_channel_size, in_channel_size), 1, 0)).view(self.batch_size, out_img_size, out_img_size, out_channel_size)
+
+
+
+
+        conv_cuda.SE3(self.all_params[blockIdx].ConvOut2, self.all_params[blockIdx].SE_W1, self.all_params[blockIdx].SE_b1,
+                      self.all_params[blockIdx].SE_W2, self.all_params[blockIdx].SE_b2,  self.all_params[blockIdx].next_fixup_bias1a, NHWC_input)
+
+        # block 4
+
+
+
+        blockIdx += 1
+        out_img_size = 2
+        out_channel_size *= 2
+        in_channel_size *= 2
+        conv_cuda.Conv2Block4(NHWC_input, self.all_params[blockIdx].Filter1, self.all_params[blockIdx].ConvOut1, self.all_params[blockIdx].Filter2, self.all_params[blockIdx].ConvOut2,
+                              self.all_params[blockIdx].fixup_bias1b, self.all_params[blockIdx].fixup_bias2a, self.all_params[blockIdx].fixup_bias2b, self.all_params[blockIdx].fixup_scale)
+
+        ## I should probably implement Avgpool2d in CUDA
+        NHWC_input = F.avg_pool2d(NHWC_input.permute(0, 3, 1, 2), 3, stride=2, padding=1).permute(0, 2, 3, 1)
+
+        # 1x1 convolution equivalent to matrix multiplication
+        NHWC_input = torch.matmul(NHWC_input.view(self.batch_size * out_img_size * out_img_size, in_channel_size), torch.transpose(
+            self.downsample_params[blockIdx-1].view(out_channel_size, in_channel_size), 1, 0)).view(self.batch_size, out_img_size, out_img_size, out_channel_size)
+
+
+
+        conv_cuda.SE4(self.all_params[blockIdx].ConvOut2, self.all_params[blockIdx].SE_W1, self.all_params[blockIdx].SE_b1,
+                      self.all_params[blockIdx].SE_W2, self.all_params[blockIdx].SE_b2,  torch.Tensor(), NHWC_input)
+
+
+
+        return NHWC_input
+
+

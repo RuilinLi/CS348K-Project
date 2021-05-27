@@ -189,11 +189,18 @@ __global__ void SEb2bGEMMFused_Kernel(
     const HALF_T next_fixup_bias1a = *next_fixup_bias1a_ptr;
 
     #pragma unroll 8
-    for(int i = 0; i < (IMG_SIZE * IMG_SIZE * K0) / blockDim.x; ++i){
+    for (int i = 0; i < (IMG_SIZE * IMG_SIZE * K0) / blockDim.x; ++i) {
         const int inner_idx = threadIdx.x + i * blockDim.x;
-        downsampled[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] +=
+        HALF_T result =
+            downsampled[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] +
             activation[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] *
-            W1_shared[inner_idx % K0] + next_fixup_bias1a;
+                W1_shared[inner_idx % K0];
+        if (result < HALF_T(0)) {
+            result = HALF_T(0);
+        }
+
+        downsampled[blockIdx.x * (IMG_SIZE * IMG_SIZE * K0) + inner_idx] =
+            result + next_fixup_bias1a;
     }
 }
 
@@ -396,9 +403,16 @@ __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
         
         #pragma unroll (IMG_SIZE * IMG_SIZE)
         for (int j = 0; j < (IMG_SIZE * IMG_SIZE); ++j) {
-            downsampled[n * IMG_SIZE * IMG_SIZE * N1 + j * N1 + c] +=
+            HALF_T result =
+                downsampled[n * IMG_SIZE * IMG_SIZE * N1 + j * N1 + c] +
                 activation[n * IMG_SIZE * IMG_SIZE * N1 + j * N1 + c] *
-                W1_shared[local_n * N1 + c] + next_fixup_bias1a;
+                    W1_shared[local_n * N1 + c];
+            if (result < HALF_T(0)) {
+                result = HALF_T(0);
+            }
+
+            downsampled[n * IMG_SIZE * IMG_SIZE * N1 + j * N1 + c] =
+                result + next_fixup_bias1a;
         }
     }
 }
