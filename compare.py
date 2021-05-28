@@ -6,11 +6,12 @@ import conv_cuda
 import torch.nn.functional as F
 
 device = torch.device("cuda")
-# with torch.cuda.amp.autocast():
-# net = torch.jit.script(se_resnet9_fixup(3, 64, -99).to(device).half())
-net = se_resnet9_fixup(3, 64, -99).to(device).half()
+# If system CUDA version is different from Pytorch CUDA build version
+# make sure to add a symlink to libnvrtc-builtins.so
+# Otherwise this will not work
+net = torch.jit.script(se_resnet9_fixup(3, 64, -99).to(device).half())
 
-batch_size = 128
+batch_size = 1024
 
 device = torch.device("cuda")
 mymodel = my_se_resnet9_fixup(net, batch_size)
@@ -29,15 +30,16 @@ if 0:
 
 
 ########## Timing #########
-large_batch_input =  torch.rand((batch_size * 100, 3, 64, 64), dtype=torch.float16, device=device)
+nrep = 1000 // (batch_size // 128)
+large_batch_input =  torch.rand((batch_size * nrep, 3, 64, 64), dtype=torch.float16, device=device)
 with torch.no_grad():
     tic = time.perf_counter()
-    for j in range(1000):
-        i = j % 100
+    for j in range(10000):
+        i = j % nrep
         data = large_batch_input[(i * batch_size):(i+1)*batch_size, ]
         #result = net(data)
         result = mymodel.RunNCHWInput(data)
         torch.cuda.synchronize()
 
     toc = time.perf_counter()
-    print(f"Finishhing 128000 inferences in {toc - tic:0.4f} seconds")
+    print(f"Finishhing {batch_size * 10000} inferences in {toc - tic:0.4f} seconds")
