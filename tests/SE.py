@@ -58,7 +58,7 @@ ref = F.relu(torch.matmul(reduced, W1) + b1)
 
 ref = torch.matmul(ref, W2) + b2
 ref = torch.sigmoid(ref)
-ref = Activation * ref.unsqueeze(1).unsqueeze(1) + fixup_bias
+ref = F.relu(Activation * ref.unsqueeze(1).unsqueeze(1)) + fixup_bias
 
 
 print((result - ref).max())

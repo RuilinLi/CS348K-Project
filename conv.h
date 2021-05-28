@@ -220,7 +220,7 @@ using ImplicitGemm32 =
 // Last block
 // Input dimension (NHWC) (batch_size, 4, 4, 256) Conv 3x3, stride 2-> (batch_size, 2, 2, 512) Conv 3x3, stride 1 -> (batch_size, 2, 2, 512)
 // GEMM1 M = batch_size * 2 * 2, N = 512, K = 3 * 3 * 256
-// GEMM2 M = batch_size * 4 * 4, N = 256, K = 3 * 3 * 512
+// GEMM2 M = batch_size * 4 * 4, N = 512, K = 3 * 3 * 512
 using ThreadblockShape_Conv41 = cutlass::gemm::GemmShape<64, 64, 32>;
 using WarpShape_Conv41 = cutlass::gemm::GemmShape<32, 32, 32>;
 using Conv2dFpropKernel41 = typename cutlass::conv::kernel::DefaultConv2dFprop<
