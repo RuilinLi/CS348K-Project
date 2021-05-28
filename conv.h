@@ -346,7 +346,5 @@ void ConvBlock(torch::Tensor Activation,
         status2 != cutlass::Status::kSuccess) {
         std::cout << cutlass::cutlassGetStatusString(status1) << std::endl;
         std::cout << cutlass::cutlassGetStatusString(status2) << std::endl;
-    } else {
-        std::cout << "No Problem!\n";
     }
 }

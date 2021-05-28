@@ -250,13 +250,6 @@ __global__ void SEb2bGEMMFused_Tensor_Core_Kernel(
     for(int i = 1; i < num_warp; ++i){
         activation_tile[i] = activation_tile[0] + warp_M * warp_K * i;
     }
-        
-    // __shared__ HALF_T activation_tile[num_warp][warp_M*warp_K];
-    // // before reduction first load W0 bias0 async to shared mem
-    // __shared__ HALF_T W0_shared[N0 * K0];
-    // __shared__ HALF_T W1_shared[N1 * K1];
-    // __shared__ HALF_T bias0_shared[N0];
-    // __shared__ HALF_T bias1_shared[N1];
 
     for (int i = 0; i < (N0 * K0 + 8 * blockDim.x - 1) / (8 * blockDim.x); ++i) {
         const int linear_idx = (i * blockDim.x + threadIdx.x) * 8;
@@ -441,7 +434,9 @@ void SE(torch::Tensor Activation,
         act_ptr, W1_ptr, bias1_ptr, W2_ptr, bias2_ptr, next_fixup_bias1a_ptr, downsampled_ptr);
 
     cudaError_t err = cudaGetLastError();
-    std::cout << cudaGetErrorString(err) << std::endl;
+    if(err != cudaSuccess){
+        std::cout << cudaGetErrorString(err) << std::endl;
+    }
 }
 
 template <int N0>
@@ -483,207 +478,7 @@ void SE_Tensor_Core(torch::Tensor Activation,
         <<<batch_size / warp_M, n_threads, maxbytes>>>(
             act_ptr, W1_ptr, bias1_ptr, W2_ptr, bias2_ptr, next_fixup_bias1a_ptr, downsampled_ptr);
     cudaError_t err = cudaGetLastError();
-    std::cout << cudaGetErrorString(err) << std::endl;
+    if(err != cudaSuccess){
+        std::cout << cudaGetErrorString(err) << std::endl;
+    }
 }
-
-template <int N0>
-class MyCudaSE{
-
-    // using ElementInput = cutlass::half_t;
-    using ElementInput = at::Half;
-    // using ElementInput = half;
-
-    ElementInput* activation;
-    ElementInput* W1;
-    ElementInput* bias1;
-    ElementInput* W2;
-    ElementInput* bias2;
-    ElementInput* downsampled;
-
-    public:
-     MyCudaSE(torch::Tensor Activation,
-              torch::Tensor W1,
-              torch::Tensor bias1,
-              torch::Tensor W2,
-              torch::Tensor bias2,
-              torch::Tensor downsampled)
-         : activation(static_cast<ElementInput*>(Activation.data_ptr())),
-           W1(static_cast<ElementInput*>(W1.data_ptr())),
-           bias1(static_cast<ElementInput*>(bias1.data_ptr())),
-           W2(static_cast<ElementInput*>(W2.data_ptr())),
-           bias2(static_cast<ElementInput*>(bias2.data_ptr())),
-           downsampled(static_cast<ElementInput*>(downsampled.data_ptr())) {
-               static_assert((N0 == 4) || (N0 == 8));
-           }
-
-    void run() {
-        SEb2bGEMMFused_Kernel<N0, ElementInput>
-            <<<128, 512>>>(activation, W1, bias1, W2, bias2, downsampled);
-        cudaError_t err = cudaGetLastError();
-        std::cout << cudaGetErrorString(err) << std::endl;
-    }
-};
-
-template <int N0>
-class MyCudaSE2{
-
-    // using ElementInput = cutlass::half_t;
-    using ElementInput = at::Half;
-    // using ElementInput = half;
-
-    ElementInput* activation;
-    ElementInput* W1;
-    ElementInput* bias1;
-    ElementInput* W2;
-    ElementInput* bias2;
-    ElementInput* downsampled;
-
-    public:
-     MyCudaSE2(torch::Tensor Activation,
-              torch::Tensor W1,
-              torch::Tensor bias1,
-              torch::Tensor W2,
-              torch::Tensor bias2,
-              torch::Tensor downsampled)
-         : activation(static_cast<ElementInput*>(Activation.data_ptr())),
-           W1(static_cast<ElementInput*>(W1.data_ptr())),
-           bias1(static_cast<ElementInput*>(bias1.data_ptr())),
-           W2(static_cast<ElementInput*>(W2.data_ptr())),
-           bias2(static_cast<ElementInput*>(bias2.data_ptr())),
-           downsampled(static_cast<ElementInput*>(downsampled.data_ptr())) {
-               static_assert((N0 == 16) || (N0 == 32));
-           }
-
-    void run() {
-        constexpr int n = 1024;
-        if (N0 == 16){
-            constexpr int warp_M = 16;
-            constexpr int channels = 256;
-            constexpr int n_threads = (channels / 16) * 32;
-            SEb2bGEMMFused_Tensor_Core_Kernel<N0, ElementInput>
-            <<<n/warp_M, n_threads, 0x6400>>>(activation, W1, bias1, W2, bias2, downsampled);
-            // SEb2bGEMMFused_Tensor_Core_Kernel<N0, ElementInput>
-            // <<<n/warp_M, n_threads>>>(activation, W1, bias1, W2, bias2, downsampled);
-
-        }
-        if (N0 == 32){
-            constexpr int warp_M = 8;
-            constexpr int channels = 512;
-            constexpr int n_threads = (channels / 16) * 32;
-            constexpr int maxbytes = 0x18000;
-            cudaFuncSetAttribute(SEb2bGEMMFused_Tensor_Core_Kernel<N0, ElementInput, warp_M>, cudaFuncAttributeMaxDynamicSharedMemorySize, maxbytes);
-            // 96KB of shared memory requires Volta and Ampere architecture (cc 7.0, 8.0, 8.6)
-            SEb2bGEMMFused_Tensor_Core_Kernel<N0, ElementInput, warp_M><<<n/warp_M, n_threads, maxbytes>>>(activation, W1, bias1, W2, bias2, downsampled);
-        }
-        cudaError_t err = cudaGetLastError();
-        std::cout << cudaGetErrorString(err) << std::endl;
-    }
-};
-
-
-
-// To start off assume input has dimension (128, 16, 16, 64)
-// To use cutlass reduction, interpret as a (1, 128,  256, 64) tensor
-// reduction -> (1, 128, 1, 64) -> row major matrix (128, 64)
-// bottle neck (128, 64) -> (128, 4) -> (128, 64):
-// let x be the resnet input (possibly downsampled), y be the output
-// what needs to be done here are
-// relu(y * se(y) + x)
-
-class ResnetSE {
-   private:
-    using Layout = cutlass::layout::TensorNHWC;
-    using ElementOutput = cutlass::half_t;
-    using ElementSource = cutlass::half_t;
-    using ElementCompute = float;
-    using ElementAccumulator = ElementCompute;
-
-    // Define the functor
-    using Functor = cutlass::plus<ElementCompute>;
-
-    static int const kV = 1;
-
-    using TensorReduction =
-        cutlass::reduction::device::TensorReduction<ElementOutput,
-                                                    ElementSource,
-                                                    Layout,
-                                                    Functor,
-                                                    kV,
-                                                    ElementCompute>;
-
-    static const cutlass::layout::TensorNHWC input_tensor_layout;
-    static const cutlass::layout::TensorNHWC squeezed_tensor_layout;
-    static const cutlass::layout::RowMajor squeezed_matrix_layout;
-    static const cutlass::layout::RowMajor W1_layout;
-    static const cutlass::layout::RowMajor W2_layout;
-    static const cutlass::layout::ColumnMajor excited_matrix_layout;
-
-    cutlass::TensorRef<ElementSource, cutlass::layout::TensorNHWC> Activation;
-    cutlass::TensorRef<ElementOutput, cutlass::layout::TensorNHWC> Squeezed;
-    cutlass::TensorRef<ElementOutput, cutlass::layout::RowMajor> W1;
-    cutlass::TensorRef<ElementOutput, cutlass::layout::ColumnMajor> bias1;
-
-    cutlass::TensorRef<ElementOutput, cutlass::layout::RowMajor> W2;
-    cutlass::TensorRef<ElementOutput, cutlass::layout::ColumnMajor> bias2;
-
-    cutlass::TensorRef<ElementOutput, cutlass::layout::ColumnMajor> Excited;
-
-    TensorReduction reduction;
-
-   public:
-    ResnetSE(torch::Tensor Activation,
-             torch::Tensor Squeezed,
-             torch::Tensor W1,
-             torch::Tensor bias1,
-             torch::Tensor W2,
-             torch::Tensor bias2,
-             torch::Tensor Excited)
-        : Activation(static_cast<ElementSource*>(Activation.data_ptr()),
-                     input_tensor_layout),
-          Squeezed(static_cast<ElementOutput*>(Squeezed.data_ptr()),
-                   squeezed_tensor_layout),
-          W1(static_cast<ElementOutput*>(W1.data_ptr()), W1_layout),
-          bias1(static_cast<ElementOutput*>(bias1.data_ptr()), {0}),
-          W2(static_cast<ElementOutput*>(W2.data_ptr()), W2_layout),
-          bias2(static_cast<ElementOutput*>(bias2.data_ptr()), {0}),
-          Excited(static_cast<ElementOutput*>(Excited.data_ptr()),
-                  excited_matrix_layout),
-          reduction({1, 128, 256, 64}, 2) {
-        CHECK_INPUT(Activation);
-        CHECK_INPUT(Squeezed);
-        CHECK_INPUT(W1);
-        CHECK_INPUT(bias1);
-        CHECK_INPUT(W2);
-        CHECK_INPUT(bias2);
-        CHECK_INPUT(Excited);
-    }
-
-    // This sums over the HW dimension, we want average.
-    // Divide the H x W extent in the next GEMM (could this cause problem in
-    // precision?)
-    void reduce() {
-        cutlass::Status status = reduction.reduce(Squeezed, Activation);
-        // if (status != cutlass::Status::kSuccess) {
-        //     std::cout << cutlass::cutlassGetStatusString(status) << std::endl;
-        // }
-
-
-        // SEb2bGEMMFused<4> b2bgemm_op;
-        // b2bgemm_op.run(Squeezed.data(), W1.data(), bias1.data(), W2.data(), bias2.data(),Excited.data());
-
-
-    }
-};
-
-const cutlass::layout::TensorNHWC ResnetSE::input_tensor_layout =
-    cutlass::layout::TensorNHWC::packed({1, 128, 256, 64});
-const cutlass::layout::TensorNHWC ResnetSE::squeezed_tensor_layout =
-    cutlass::layout::TensorNHWC::packed({1, 128, 1, 64});
-const cutlass::layout::RowMajor ResnetSE::squeezed_matrix_layout =
-    cutlass::layout::RowMajor::packed({128, 64});
-const cutlass::layout::RowMajor ResnetSE::W1_layout =
-    cutlass::layout::RowMajor::packed({64, 4});
-const cutlass::layout::RowMajor ResnetSE::W2_layout =
-    cutlass::layout::RowMajor::packed({4, 64});
-const cutlass::layout::ColumnMajor ResnetSE::excited_matrix_layout =
-    cutlass::layout::ColumnMajor::packed({128, 64});
